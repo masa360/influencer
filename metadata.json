@@ -1,0 +1,6 @@
+{
+  "name": "AI Influencer Lead-Gen Agent",
+  "description": "あなた公式のAI広報キャラが専門性を伝え、24時間自動で見込み客を個別相談やLINEへ案内する広報AI構築スタジオ",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

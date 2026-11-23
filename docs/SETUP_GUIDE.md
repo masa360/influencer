@@ -1,0 +1,218 @@
+# はじめての導入ガイド（LINE＋サイトから始める版）
+
+プログラミング未経験でも進められるように、1ステップずつ書いています。
+**X(旧Twitter)はこの版では対象外**です。Instagram / Facebook / YouTube は、LINE で手応えが出てから追加する想定です。
+
+---
+
+## 全体の流れ
+
+| STEP | やること | 目安時間 | お金 |
+|---|---|---|---|
+| 0 | 準備するものをそろえる | 30分 | 0円 |
+| 1 | 自分のパソコンで動かす | 30〜60分 | 0円 |
+| 2 | AIキャラとボス（あなた）を設定し、返信の質を確認する | 1〜2時間 | Gemini 利用料（少額） |
+| 3 | インターネットに公開する（Google Cloud Run） | 1〜2時間 | 少額（後述） |
+| 4 | LINE公式アカウントとつなぐ | 1時間 | 0円〜 |
+| 5 | 下書きモードで1〜2週間運用 → 全自動へ | 継続 | ー |
+| 6 | （任意）自分のサイトにチャットを設置 | 30分 | 0円 |
+
+---
+
+## STEP 0. 準備するもの
+
+- パソコン（Mac / Windows どちらでも可）
+- Google アカウント（Gemini の API キーと Google Cloud に使う）
+- LINE公式アカウント（まだなければ STEP 4 で作る）
+- クレジットカード（Google Cloud の利用登録に必要。無料枠の範囲なら請求はほぼ発生しない）
+
+---
+
+## STEP 1. 自分のパソコンで動かす
+
+### 1-1. Node.js を入れる
+1. https://nodejs.org を開き、**LTS 版（22 以上）**をダウンロードしてインストールする。
+2. ターミナル（Mac：「ターミナル」アプリ / Windows：「PowerShell」）を開き、次を入力して数字が出ればOK。
+
+```bash
+node -v
+```
+
+### 1-2. このフォルダに移動して、部品をインストールする
+zip を解凍したフォルダに移動して（`cd` のあとにフォルダをドラッグ＆ドロップすると、場所が入力される）、次を実行する。
+
+```bash
+npm install
+```
+
+### 1-3. 設定ファイル `.env` を作る
+
+```bash
+cp .env.example .env
+```
+
+Windows の PowerShell では次を使う。
+
+```bash
+copy .env.example .env
+```
+
+`.env` をメモ帳などで開き、まず次の **2つだけ** 設定する。
+
+| 項目 | 入れる値 | 取り方 |
+|---|---|---|
+| `GEMINI_API_KEY` | Gemini の API キー | https://aistudio.google.com を開き、「Get API key」→「Create API key」 |
+| `ADMIN_TOKEN` | 長いランダムな文字列（管理画面の合言葉） | 下のコマンドで作る |
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+```
+
+> ⚠️ `.env` は合言葉や鍵が入った大事なファイルです。人に送ったり、ネットに上げたりしないでください。
+
+### 1-4. 起動する
+
+```bash
+npm run dev
+```
+
+ブラウザで http://localhost:3000 を開いて、画面が出れば成功。
+止めるときは、ターミナルで `Ctrl + C` を押す。
+
+---
+
+## STEP 2. AIキャラとボスを設定し、返信の質を確認する
+
+1. **「AIキャラ＆ボス設定」タブ**でボス（あなた）の情報を入力する。
+   - 「ボスの強み・実績」には、**本当の実績だけ**を書く。AIはここに書いた数字以外は使わないようにしてあります。
+2. AIキャラのテンプレートを選んで、口調などを調整する。
+   - 関係性の欄には「〇〇（あなたの屋号）公式のAI広報」と分かる説明を残す。
+3. **「DM誘導シミュレーター」タブ**で、見込み客になりきってメッセージを送り、返信の質を確認する。
+   - 初回は管理トークン（`ADMIN_TOKEN` の値）の入力を求められます。
+4. 気になる返信があれば、キャラの口調や関係性の文章を直して、もう一度試す。
+
+> 💡 **ステマ規制への配慮**：AIキャラが「無関係の第三者」や「サービスを使ったお客さん」のふりをすると、景品表示法のステマ規制に当たるおそれがあります。この版は、AIが「運営者公式のAI」であることを明かす設計にしています。SNSのプロフィールにも「〇〇公式のAI広報キャラクター」と書いてください。
+
+---
+
+## STEP 3. インターネットに公開する（Google Cloud Run）
+
+LINE からメッセージを受け取るには、アプリをインターネットに置く必要があります。
+
+### 3-1. Google Cloud の準備（初回のみ）
+1. https://console.cloud.google.com で新しいプロジェクトを作り、課金（請求先アカウント）を有効にする。
+2. Google Cloud CLI（`gcloud` コマンド）をインストールする：https://cloud.google.com/sdk/docs/install
+3. ターミナルでログインして、プロジェクトを選ぶ（`あなたのプロジェクトID` は置き換える）。
+
+```bash
+gcloud auth login
+```
+
+```bash
+gcloud config set project あなたのプロジェクトID
+```
+
+### 3-2. データ保存用の置き場（バケット）を作る
+Cloud Run は再起動するとファイルが消えるので、設定や受信ログは Cloud Storage に保存します。
+バケット名は世界で1つだけの名前にしてください（例：`leadgen-data-自分の名前-2026`）。
+
+```bash
+gcloud storage buckets create gs://あなたのバケット名 --location=asia-northeast1
+```
+
+### 3-3. 公開用の設定ファイル `env.yaml` を作る
+プロジェクトのフォルダに `env.yaml` という名前のファイルを作り、次のように書く（LINE の値は STEP 4 で取得してから追加すればOK）。
+
+```yaml
+GEMINI_API_KEY: "ここにGeminiのAPIキー"
+ADMIN_TOKEN: "ここにSTEP1で作った合言葉"
+LINE_CHANNEL_SECRET: ""
+LINE_CHANNEL_ACCESS_TOKEN: ""
+```
+
+> ⚠️ `env.yaml` も `.env` と同じく秘密のファイルです（Git やコンテナには含まれない設定にしてあります）。
+
+### 3-4. デプロイ（公開）する
+
+```bash
+gcloud run deploy leadgen-agent --source . --region asia-northeast1 --allow-unauthenticated --max-instances 1 --no-cpu-throttling --execution-environment gen2 --env-vars-file env.yaml --add-volume name=data,type=cloud-storage,bucket=あなたのバケット名 --add-volume-mount volume=data,mount-path=/data
+```
+
+各オプションの意味：
+- `--max-instances 1`：このアプリはサーバー1台で動く前提のため（2台以上だとデータが食い違う）
+- `--no-cpu-throttling`：LINE に「受け取りました」と返したあとも、AIが返信を作り続けられるようにする
+- `--add-volume ...`：データを Cloud Storage に保存して、再起動しても消えないようにする
+
+最後に表示される `Service URL: https://leadgen-agent-xxxxx.asia-northeast1.run.app` があなたのアプリの住所です。ブラウザで開いて画面が出れば成功。
+
+> 費用の目安：利用がないときは0台まで縮むので、少人数の問い合わせなら Cloud Run は無料枠に収まることが多いです。Gemini は使った分だけ課金されます。正確な金額は Google Cloud の料金ページで確認し、**予算アラート**（「お支払い」→「予算とアラート」）を設定しておくと安心です。
+
+---
+
+## STEP 4. LINE公式アカウントとつなぐ
+
+### 4-1. Messaging API を有効にする
+1. LINE Official Account Manager（https://manager.line.biz）で公式アカウントを作る（既にあればそれを使う）。
+2. 「設定」→「Messaging API」→「Messaging APIを利用する」を押す（プロバイダーは新規作成でOK）。
+3. LINE Developers（https://developers.line.biz/console/）を開き、作られたチャネルを選ぶ。
+   - 「チャネル基本設定」タブ →「チャネルシークレット」をコピー → `env.yaml` の `LINE_CHANNEL_SECRET` に貼る
+   - 「Messaging API設定」タブ →「チャネルアクセストークン（長期）」を発行してコピー → `LINE_CHANNEL_ACCESS_TOKEN` に貼る
+
+### 4-2. 設定を反映する
+STEP 3-4 と同じ `gcloud run deploy ...` コマンドをもう一度実行する。
+
+### 4-3. Webhook を登録する
+1. LINE Developers の「Messaging API設定」タブ →「Webhook URL」に次を入れる：
+   `https://（あなたのService URL）/webhooks/line`
+2. 「検証」を押して「成功」と出ればOK。
+3. 「Webhookの利用」をオンにする。
+4. LINE Official Account Manager →「応答設定」で、**「応答メッセージ」をオフ**にする（オンだと定型文とAIの返信が両方送られてしまう）。
+
+### 4-4. アプリ側で自動返信をオンにする
+1. アプリの画面を開き、「自動返信（API連携）」タブで管理トークンを入力する。
+2. 「現在の設定をサーバーに反映」を押す。
+3. LINE のカードで **「下書き（承認制）」** を選んで保存する。
+4. 画面上部の「自動返信を開始する」を押す。
+5. 自分のスマホから公式アカウントにメッセージを送る → 受信ログに返信案が出ることを確認する → 「この内容で送信」を押して届けば完成🎉
+
+> 💡 LINE の料金について：すぐに返す「応答メッセージ」は無料です。下書きを承認してあとから送る場合は「プッシュメッセージ」になり、プランの月間無料通数にカウントされます。
+
+---
+
+## STEP 5. 運用のコツ
+
+- **最初の1〜2週間は「下書き」**のまま運用し、返信を毎日チェックする。
+- 問題がなければ LINE を「全自動」に切り替える。
+- おかしな返信が出たら、画面上部の **「緊急停止」** ですぐ止められる。
+- 「返金」「解約」「クレーム」などを含むメッセージは、AIが返信せず「要人間対応」に回る。受信ログをこまめに確認する。
+- Slack や Discord に通知したい場合は、画面の「通知先Webhook URL」に設定する。
+
+---
+
+## STEP 6.（任意）自分のサイトにチャットを設置する
+
+1. 「自動返信」タブの「LP / HP」カードを開き、「許可するサイトのURL」に自分のサイトのURL（例：`https://www.example.com`）を入れて保存する。
+2. 表示された `<script ...>` の1行を、サイトの HTML（`</body>` の直前）に貼る。
+   - WordPress なら「外観 → テーマファイルエディター」やヘッダー/フッター用のプラグインで貼れる。
+3. LP / HP のモードを「下書き」→ 様子を見て「全自動」に。
+
+---
+
+## 困ったときは
+
+| 症状 | 原因と対処 |
+|---|---|
+| `npm install` でエラー | Node.js のバージョンが古い可能性。`node -v` で 22 以上か確認する |
+| 画面で「管理トークンが正しくありません」 | `ADMIN_TOKEN` に設定した値と同じものを入力しているか確認する |
+| 「GEMINI_API_KEY が未設定です」 | `.env`（公開後は `env.yaml`）にキーを入れて、再起動／再デプロイする |
+| LINE の Webhook 検証が失敗する | URL の末尾が `/webhooks/line` か、`LINE_CHANNEL_SECRET` が正しいか確認する |
+| LINE で返信が来ない | 「自動返信を開始する」を押したか、LINE のモードが「オフ」になっていないか、受信ログに「エラー」が出ていないか確認する |
+| 再デプロイしたら設定が消えた | `--add-volume` と `--add-volume-mount` を付け忘れていないか確認する |
+
+---
+
+## あとから追加するとき
+
+- **Instagram / Facebook**：Meta for Developers でアプリを作り、App Review（審査）を通す必要があります。審査に数週間かかることがあるので、早めに申請だけ進めておくのがおすすめです。必要な環境変数は README の「チャンネル別の接続手順」を参照してください。
+- **YouTube**：Google Cloud で OAuth を設定し、リフレッシュトークンを取得します。コメントを定期的に確認する仕組みなので、Cloud Run では `--min-instances 1`（常に1台起動、費用が増える）が必要です。
+- **X**：有料APIプランが前提のため、この版では外しています。必要になったら、受け取った元の版から X の実装を戻します。
