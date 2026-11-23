@@ -78,4 +78,7 @@ export function registerRoutes(app: Express) {
   app.post('/api/admin/keys/rotate', adapt(h.adminRotateKey));
   app.post('/api/admin/youtube/poll', adapt(h.adminYoutubePoll));
   app.post('/api/admin/test-notify', adapt(h.adminTestNotify));
+  app.post('/api/admin/line/register-code', adapt(h.adminLineRegisterCode));
+  app.post('/api/admin/line/setup-webhook', adapt(h.adminLineSetupWebhook));
+  app.get('/api/admin/gas-code', adapt(h.adminGasCode));
 }

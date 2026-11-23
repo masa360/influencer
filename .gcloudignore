@@ -1,0 +1,12 @@
+# Cloud Run へのアップロードから除外するファイル（npm run deploy / gcloud run deploy --source）
+# ※ .env（キー・合言葉）は絶対にアップロードしない。キーは環境変数として別に渡される
+.env
+.env.*
+!.env.example
+env.yaml
+.git
+node_modules
+dist
+data
+*.log
+*.zip

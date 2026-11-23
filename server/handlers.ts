@@ -4,6 +4,7 @@ import {
   newId,
   getApiKey,
   getConfig,
+  getSheetKey,
   listEntries,
   rotateApiKey,
   rotateSiteKey,
@@ -15,13 +16,17 @@ import {
 import {
   credentialStatus,
   pushLineToOwners,
+  replyLine,
+  setupLineWebhook,
   parseLine,
   parseMeta,
   verifyLine,
   verifyMeta,
   type Inbound,
 } from './channels.ts';
-import { approveEntry, buildNotifyText, entryPayload, HttpError, previewReply, processInbound, rejectEntry } from './pipeline.ts';
+import { approveEntry, buildNotifyText, entryPayload, HttpError, previewReply, processInbound, rejectEntry, sheetUrlWithKey } from './pipeline.ts';
+import { handleRegistration, isRegistrationMessage, issueRegistrationCode, REGISTRATION_REPLY } from './lineRegister.ts';
+import fs from 'node:fs';
 import { pollYouTubeOnce } from './youtube.ts';
 import { WIDGET_JS } from './widget.ts';
 import { cleanInput, envValue, httpJson, safeEqual, tryConsume } from './util.ts';
@@ -91,7 +96,22 @@ export const metaWebhookPost: Handler = (req) => {
 
 export const lineWebhookPost: Handler = (req) => {
   if (!verifyLine(req.rawBody, req.headers['x-line-signature'])) return err(401, 'invalid_signature');
-  background(parseLine(req.body));
+  const items = parseLine(req.body);
+  // 「通知登録 123456」は運営者の通知先登録として処理し、AIの自動返信には回さない
+  // （自動返信が停止中でも登録できるように、パイプラインより先に判定する）
+  const normal: Inbound[] = [];
+  for (const it of items) {
+    if (isRegistrationMessage(it.text)) {
+      const result = handleRegistration(it.text, it.senderId);
+      console.log('[line] 通知先の登録:', result);
+      if (it.ref.replyToken) {
+        void replyLine(it.ref.replyToken, REGISTRATION_REPLY[result]).catch((e) => console.warn('[line] reply failed:', e.message));
+      }
+    } else {
+      normal.push(it);
+    }
+  }
+  background(normal);
   return ok();
 };
 
@@ -375,12 +395,13 @@ export const adminTestNotify: Handler = guarded(async () => {
     }
   }
 
-  if (!cfg.sheetWebhookUrl || !isSafeWebhookUrl(cfg.sheetWebhookUrl)) {
+  const sheetUrl = sheetUrlWithKey(cfg.sheetWebhookUrl);
+  if (!sheetUrl) {
     result.sheet = { ok: false, message: '記録用Webhook URLが未設定です' };
   } else {
     try {
       const r = await httpJson(
-        cfg.sheetWebhookUrl,
+        sheetUrl,
         { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entryPayload(sample)) },
         10_000
       );
@@ -405,4 +426,48 @@ export const adminTestNotify: Handler = guarded(async () => {
   }
 
   return ok({ result });
+});
+
+// ---------------------------------------------------------------------------
+// 自動設定（手作業を減らすための管理API）
+// ---------------------------------------------------------------------------
+
+/** 「自分のLINEを通知先に登録」用の6桁コードを発行する（有効期限10分） */
+export const adminLineRegisterCode: Handler = guarded(() => {
+  if (!envValue('LINE_CHANNEL_ACCESS_TOKEN') || !envValue('LINE_CHANNEL_SECRET')) {
+    return err(400, 'LINEの設定（LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN）が先に必要です');
+  }
+  return ok({ ok: true, ...issueRegistrationCode() });
+});
+
+/** LINE に Webhook URL を自動登録し、疎通テストまで行う */
+export const adminLineSetupWebhook: Handler = guarded(async (req) => {
+  if (!envValue('LINE_CHANNEL_ACCESS_TOKEN') || !envValue('LINE_CHANNEL_SECRET')) {
+    return err(400, 'LINEの設定（LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN）が先に必要です');
+  }
+  const endpoint = `${req.baseUrl.replace(/\/$/, '')}/webhooks/line`;
+  try {
+    return ok({ result: await setupLineWebhook(endpoint) });
+  } catch (e) {
+    return err(502, (e as Error).message);
+  }
+});
+
+/** GAS コードの置き場所（リポジトリの gas/Code.gs） */
+const GAS_CODE_PATH = new URL('../gas/Code.gs', import.meta.url);
+
+/**
+ * 合言葉を書き込み済みの GAS コードを返す（画面の「GASコードをコピー」用）。
+ * これをスプレッドシートの Apps Script に貼るだけでよく、合言葉を手で書く必要がない。
+ */
+export const adminGasCode: Handler = guarded(() => {
+  let code: string;
+  try {
+    code = fs.readFileSync(GAS_CODE_PATH, 'utf8');
+  } catch {
+    return err(500, 'gas/Code.gs が見つかりません');
+  }
+  const key = getSheetKey();
+  code = code.replace(/^const SECRET_KEY = '.*';.*$/m, `const SECRET_KEY = '${key}'; // アプリが自動で作った合言葉（変更しないでください）`);
+  return { status: 200, text: code, contentType: 'text/plain; charset=utf-8' };
 });

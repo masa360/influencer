@@ -92,7 +92,7 @@ interface DB {
   convos: Record<string, Msg[]>;
   tokens: Record<string, TokenRec>;
   kv: Record<string, string>;
-  secrets: { apiKey: string };
+  secrets: { apiKey: string; sheetKey: string };
 }
 
 const MAX_LOG = 2000;
@@ -134,7 +134,7 @@ const dataDir = () => path.resolve(process.env.DATA_DIR || 'data');
 const dbFile = () => path.join(dataDir(), 'db.json');
 
 function emptyDB(): DB {
-  return { config: defaultConfig(), log: [], seen: [], convos: {}, tokens: {}, kv: {}, secrets: { apiKey: '' } };
+  return { config: defaultConfig(), log: [], seen: [], convos: {}, tokens: {}, kv: {}, secrets: { apiKey: '', sheetKey: '' } };
 }
 
 let db: DB | null = null;
@@ -170,7 +170,7 @@ function load(): DB {
     base.convos = parsed.convos || {};
     base.tokens = parsed.tokens || {};
     base.kv = parsed.kv || {};
-    base.secrets = { apiKey: parsed.secrets?.apiKey || '' };
+    base.secrets = { apiKey: parsed.secrets?.apiKey || '', sheetKey: parsed.secrets?.sheetKey || '' };
   } catch {
     /* 初回起動 or 破損 → 初期値 */
   }
@@ -409,6 +409,39 @@ export function getApiKey(): string {
     scheduleSave();
   }
   return d.secrets.apiKey;
+}
+
+/**
+ * スプレッドシート記録（GAS）用の合言葉。初回に自動生成して保存する。
+ * 画面の「GASコードをコピー」で、この値が入ったコードを配布する。
+ *
+ * @example
+ * const key = getSheetKey(); // 'gk_xxxxxxxx...'
+ */
+export function getSheetKey(): string {
+  const d = load();
+  if (!d.secrets.sheetKey) {
+    d.secrets.sheetKey = 'gk_' + rand(16);
+    scheduleSave();
+  }
+  return d.secrets.sheetKey;
+}
+
+/**
+ * LINE通知の送信先ユーザーIDを追加する（重複は無視・最大5件）。通知もオンにする。
+ * @returns 追加後のユーザーID一覧
+ */
+export function addLineNotifyUser(userId: string): string[] {
+  const c = load().config;
+  if (!isLineUserId(userId)) throw new Error('LINEユーザーIDの形式が正しくありません');
+  if (!c.lineNotify.userIds.includes(userId)) {
+    if (c.lineNotify.userIds.length >= 5) throw new Error('通知先は最大5件です');
+    c.lineNotify.userIds = [...c.lineNotify.userIds, userId];
+  }
+  c.lineNotify.enabled = true;
+  c.updatedAt = new Date().toISOString();
+  scheduleSave();
+  return c.lineNotify.userIds;
 }
 
 export function rotateApiKey(): string {

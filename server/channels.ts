@@ -194,6 +194,75 @@ async function sendLine(e: Entry, text: string) {
 }
 
 /**
+ * LINEの「応答メッセージ」（reply API・無料）で1通返す。
+ * @example await replyLine(replyToken, '登録しました');
+ */
+export async function replyLine(replyToken: string, text: string): Promise<void> {
+  const token = env('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!token) throw new Error('LINE_CHANNEL_ACCESS_TOKEN が未設定です');
+  await httpJson('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text: clipChars(text, 4500) }] }),
+  });
+}
+
+export interface LineWebhookSetupResult {
+  ok: boolean;
+  endpoint: string;
+  /** LINE Developers の「Webhookの利用」がオンか（取得できなければ null） */
+  active: boolean | null;
+  /** LINEからこのアプリへの疎通テストの結果 */
+  test: { success: boolean; statusCode?: number; reason?: string; detail?: string } | null;
+  message: string;
+}
+
+/**
+ * LINE Messaging API で Webhook URL を登録し、疎通テストまで行う。
+ * （LINE Developers の画面で URL を貼って「検証」を押す作業の自動化）
+ *
+ * @param endpoint 登録する Webhook URL（https 必須。例: https://xxx.run.app/webhooks/line）
+ * @example
+ * const r = await setupLineWebhook('https://xxx.run.app/webhooks/line');
+ * if (r.ok && r.active === false) console.log('「Webhookの利用」をオンにしてください');
+ */
+export async function setupLineWebhook(endpoint: string): Promise<LineWebhookSetupResult> {
+  const token = env('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!token) throw new Error('LINE_CHANNEL_ACCESS_TOKEN が未設定です');
+  if (!/^https:\/\//.test(endpoint)) {
+    throw new Error('Webhook URL は https で始まる公開URLが必要です（Cloud Run に公開してから実行してください）');
+  }
+  const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+  const base = 'https://api.line.me/v2/bot/channel/webhook';
+
+  await httpJson(`${base}/endpoint`, { method: 'PUT', headers, body: JSON.stringify({ endpoint }) });
+
+  let test: LineWebhookSetupResult['test'] = null;
+  try {
+    const t = await httpJson(`${base}/test`, { method: 'POST', headers, body: JSON.stringify({ endpoint }) }, 20_000);
+    test = { success: !!t?.success, statusCode: t?.statusCode, reason: t?.reason, detail: t?.detail };
+  } catch (e) {
+    test = { success: false, reason: (e as Error).message };
+  }
+
+  let active: boolean | null = null;
+  try {
+    const info = await httpJson(`${base}/endpoint`, { headers });
+    active = typeof info?.active === 'boolean' ? info.active : null;
+  } catch {
+    /* 取得できなくても登録自体は完了している */
+  }
+
+  const ok = !!test?.success;
+  const message = !ok
+    ? `Webhook URL は登録しましたが、疎通テストに失敗しました（${test?.reason || test?.detail || '不明'}）。アプリが公開されているか、LINE_CHANNEL_SECRET が正しいか確認してください。`
+    : active === false
+      ? 'Webhook URL を登録し、疎通テストも成功しました。最後に LINE Developers の「Messaging API設定」で「Webhookの利用」をオンにしてください。'
+      : 'Webhook URL を登録し、疎通テストも成功しました。';
+  return { ok, endpoint, active, test, message };
+}
+
+/**
  * 運営者自身のLINE（複数可）へ通知を送る（Messaging API の multicast）。
  * ※ プッシュ/マルチキャストは、公式アカウントの月間メッセージ通数にカウントされます。
  *

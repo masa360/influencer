@@ -1,19 +1,21 @@
 /**
  * 受信ログをGoogleスプレッドシートに記録する Google Apps Script（GAS）。
  *
- * 使い方（くわしくは docs/SETUP_GUIDE.md の「STEP 5-2」）:
- *   1. 記録用のスプレッドシートを作り、「拡張機能」→「Apps Script」を開く
- *   2. このファイルの中身をすべて貼り付ける
- *   3. 下の SECRET_KEY を、自分だけが知っている長い文字列に書き換えて保存する
- *   4. 「デプロイ」→「新しいデプロイ」→ 種類「ウェブアプリ」
+ * 使い方（くわしくは docs/SETUP_GUIDE.md の「STEP 5」）:
+ *   1. アプリの「自動返信」タブ →「GASコードをコピー」でこのコードをコピーする
+ *      （合言葉 SECRET_KEY は入力済み。手で書き換える必要はありません）
+ *   2. 記録用のスプレッドシートを作り、「拡張機能」→「Apps Script」に貼り付けて保存
+ *   3. 「デプロイ」→「新しいデプロイ」→ 種類「ウェブアプリ」
  *        実行するユーザー: 自分 / アクセスできるユーザー: 全員
- *   5. 発行されたURL（…/exec）の末尾に ?key=SECRET_KEYの値 を付けて、
- *      アプリの「記録用Webhook URL（GAS）」に貼る
+ *   4. 発行されたURL（…/exec）を、アプリの「記録用Webhook URL（GAS）」に貼る
+ *      （合言葉 ?key= はアプリが自動で付けます）
+ *
+ * ※ このファイルを直接コピーした場合は、下の SECRET_KEY を書き換え、URL の末尾に ?key=同じ値 を付けてください。
  *
  * 同じ受信（id）が「受信時・承認時・却下時」に何度か届くため、id が一致する行は上書き更新します。
  */
 
-/** 合言葉。アプリに設定するURLの ?key= と同じ値にする（必ず書き換える） */
+/** 合言葉（アプリの「GASコードをコピー」なら自動で入ります） */
 const SECRET_KEY = 'ここを長いランダムな文字列に書き換える';
 
 /** 記録するシート名（無ければ自動で作る） */
@@ -44,6 +46,10 @@ const STATUS_LABEL = {
  * //   "leadScore": 85, "sender": { "name": "山田" }, "message": "相談したい", ... }
  */
 function doPost(e) {
+  // 合言葉が初期値のままなら受け付けない（誰でも書き込めてしまうため）
+  if (/^ここを/.test(SECRET_KEY)) {
+    return json_({ ok: false, error: 'secret_not_set（アプリの「GASコードをコピー」で取得したコードを使ってください）' });
+  }
   // 合言葉の確認（URLの ?key= ）
   if (!e || !e.parameter || e.parameter.key !== SECRET_KEY) {
     return json_({ ok: false, error: 'invalid_key' });

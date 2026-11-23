@@ -14,6 +14,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { TOKEN_KEY } from './apiClient.ts';
+import { BOSS_FIELD_LABEL, sampleFields } from './sample.ts';
 
 // ---------------------------------------------------------------------------
 // 型・定数
@@ -26,6 +27,8 @@ type ChannelId = 'instagram' | 'facebook' | 'youtube' | 'line' | 'web';
 interface Props {
   persona: { name: string; role: string; tone: string; relationToBoss: string; visualStyle: string };
   bossProfile: Record<string, string>;
+  /** サーバーに反映済みの設定を、画面（ブラウザ）側に読み込む */
+  onLoadFromServer?: (bossProfile: Record<string, string>, persona: Record<string, string>) => void;
 }
 
 const CHANNELS: { id: ChannelId; label: string; icon: string; desc: string; hook?: 'meta' | 'line' }[] = [
@@ -125,7 +128,7 @@ const inputCls =
 // 本体
 // ---------------------------------------------------------------------------
 
-export default function AutoReply({ persona, bossProfile }: Props) {
+export default function AutoReply({ persona, bossProfile, onLoadFromServer }: Props) {
   const [token, setToken] = useState(() => sessionStorage.getItem(TOKEN_KEY) || '');
   const [tokenInput, setTokenInput] = useState('');
   const [server, setServer] = useState<any>(null);
@@ -134,6 +137,12 @@ export default function AutoReply({ persona, bossProfile }: Props) {
   const [keywordsText, setKeywordsText] = useState('');
   const [lineIdsText, setLineIdsText] = useState('');
   const [notifyTest, setNotifyTest] = useState<Record<string, { ok: boolean; message: string }> | null>(null);
+  /** 通知先登録コード（自分のLINEから送ってもらう） */
+  const [regCode, setRegCode] = useState<{ code: string; message: string; expiresAt: string } | null>(null);
+  /** LINE Webhook 自動設定の結果 */
+  const [lineSetup, setLineSetup] = useState<{ ok: boolean; active: boolean | null; message: string; endpoint: string } | null>(null);
+  /** クリップボードにコピーできなかったときに表示する GAS コード */
+  const [gasCodeText, setGasCodeText] = useState('');
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState('');
   const [needsAuth, setNeedsAuth] = useState(false);
@@ -246,6 +255,84 @@ export default function AutoReply({ persona, bossProfile }: Props) {
       'save'
     );
 
+  /** 通知先登録コードを発行する（自分のLINEから送ると、自動で通知先に追加される） */
+  const issueRegCode = async () => {
+    setBusy('reg');
+    try {
+      const d = await api('/api/admin/line/register-code', token, { method: 'POST', body: '{}' });
+      setRegCode({ code: d.code, message: d.message, expiresAt: d.expiresAt });
+      setError('');
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  // コード発行中は3秒ごとにサーバーを確認し、登録されたら画面に反映する
+  useEffect(() => {
+    if (!regCode) return;
+    const known = new Set(lineIdsText.split(/[\s,、]+/).filter(Boolean));
+    const t = setInterval(async () => {
+      if (Date.parse(regCode.expiresAt) < Date.now()) {
+        setRegCode(null);
+        setError('登録コードの有効期限が切れました。もう一度「コードを発行」を押してください。');
+        return;
+      }
+      try {
+        const s = await api('/api/admin/state', token);
+        const ids: string[] = s.config.lineNotify?.userIds || [];
+        if (ids.some((id) => !known.has(id))) {
+          const merged = [...new Set([...known, ...ids])];
+          setServer(s);
+          setLineIdsText(merged.join('\n'));
+          setDraft((d: any) => ({ ...d, lineNotify: { ...(d.lineNotify || {}), enabled: true, userIds: merged } }));
+          setRegCode(null);
+          notify('✅ あなたのLINEを通知先に登録しました');
+        }
+      } catch {
+        /* 次の確認で再試行 */
+      }
+    }, 3000);
+    return () => clearInterval(t);
+  }, [regCode, token, lineIdsText]);
+
+  /** LINE に Webhook URL を自動登録し、疎通テストする */
+  const autoSetupLine = async () => {
+    setBusy('lineSetup');
+    setLineSetup(null);
+    try {
+      const d = await api('/api/admin/line/setup-webhook', token, { method: 'POST', body: '{}' });
+      setLineSetup(d.result);
+      setError('');
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  /** 合言葉入りの GAS コードをクリップボードにコピーする */
+  const copyGasCode = async () => {
+    setBusy('gas');
+    try {
+      const res = await fetch('/api/admin/gas-code', { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      if (!res.ok) throw new Error(`GASコードを取得できませんでした（HTTP ${res.status}）`);
+      const text = await res.text();
+      try {
+        await navigator.clipboard.writeText(text);
+        setGasCodeText('');
+        notify('GASコードをコピーしました。Apps Script に貼り付けてください');
+      } catch {
+        setGasCodeText(text); // コピーできない環境では、画面に表示して手動でコピーしてもらう
+      }
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy('');
+    }
+  };
+
   /** 保存済みの LINE通知 / 記録用Webhook にテスト送信する */
   const testNotify = async () => {
     setBusy('notify');
@@ -262,6 +349,9 @@ export default function AutoReply({ persona, bossProfile }: Props) {
 
   const toggleMaster = async () => {
     const next = !server.config.masterEnabled;
+    if (next && sampleFields(server.config.bossProfile).length) {
+      if (!window.confirm('⚠️ サーバーのボス情報に、サンプル（【例】・〇〇）が残っています。このままだとAIがサンプルの内容を話してしまいます。それでも開始しますか？')) return;
+    }
     if (next && !window.confirm('自動返信を有効にします。「全自動」にしたチャンネルでは、届いたメッセージにAIが自動で返信します。よろしいですか？')) return;
     await put({ masterEnabled: next }, 'master');
   };
@@ -472,13 +562,34 @@ export default function AutoReply({ persona, bossProfile }: Props) {
             {synced ? `反映済み：${persona.name}` : cfg.persona ? '未反映の変更があります（サーバーは古い設定で動作中）' : '未反映（自動返信は動作しません）'}
           </span>
           <button
-            onClick={() => put(personaPayload, 'persona')}
+            onClick={() => {
+              const left = sampleFields(bossProfile);
+              if (left.length && !window.confirm(`ボス情報の「${left.map((k) => BOSS_FIELD_LABEL[k]).join('」「')}」がサンプルのままです。このまま反映しますか？`)) return;
+              put(personaPayload, 'persona');
+            }}
             disabled={busy === 'persona' || synced}
             className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 disabled:opacity-40"
           >
             現在の設定をサーバーに反映
           </button>
         </div>
+        {/* 公開版を別のブラウザで開いたとき：サーバーの設定を読み込める */}
+        {!synced && cfg.persona && cfg.bossProfile && sampleFields(bossProfile).length > 0 && sampleFields(cfg.bossProfile).length === 0 && onLoadFromServer && (
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-2.5">
+            <span className="text-[11px] text-emerald-200">サーバーには「{cfg.persona.name}」の設定が保存されています。</span>
+            <button
+              onClick={() => onLoadFromServer(cfg.bossProfile, cfg.persona)}
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-500 hover:bg-emerald-400 text-slate-950"
+            >
+              この画面に読み込む
+            </button>
+          </div>
+        )}
+        {sampleFields(bossProfile).length > 0 && (
+          <p className="text-[11px] text-amber-300">
+            ⚠️ ボス情報の「{sampleFields(bossProfile).map((k) => BOSS_FIELD_LABEL[k]).join('」「')}」がサンプル（【例】・〇〇）のままです。「AIキャラ＆ボス設定」タブで、あなたの本当の情報に書き換えてください。
+          </p>
+        )}
       </Card>
 
       {/* チャンネル */}
@@ -535,6 +646,26 @@ export default function AutoReply({ persona, bossProfile }: Props) {
                   </div>
                 </div>
 
+                {ch.id === 'line' && (
+                  <div className="space-y-2 pt-1">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        onClick={autoSetupLine}
+                        disabled={busy === 'lineSetup' || !cred.line?.configured}
+                        className="px-3 py-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-40 flex items-center gap-1.5"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${busy === 'lineSetup' ? 'animate-spin' : ''}`} />
+                        LINEにWebhookを自動設定（登録＋接続テスト）
+                      </button>
+                      <span className="text-[11px] text-slate-500">公開後（https）に使えます。npm run deploy でも自動で実行されます。</span>
+                    </div>
+                    {lineSetup && (
+                      <p className={`text-[11px] ${lineSetup.ok && lineSetup.active !== false ? 'text-emerald-300' : 'text-amber-300'}`}>
+                        {lineSetup.ok && lineSetup.active !== false ? '✅' : '⚠️'} {lineSetup.message}
+                      </p>
+                    )}
+                  </div>
+                )}
                 {c.mode !== 'off' && (
                   <div className="space-y-3 pt-1">
                     <div>
@@ -654,8 +785,33 @@ export default function AutoReply({ persona, bossProfile }: Props) {
             />
             見込み客・要人間対応が来たら、自分のLINEに通知する
           </label>
+          <div className="rounded-lg bg-slate-950 border border-slate-800 p-3 space-y-2">
+            <div className="text-xs font-semibold text-slate-200">かんたん登録：自分のLINEからコードを送るだけ</div>
+            {!regCode ? (
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  onClick={issueRegCode}
+                  disabled={busy === 'reg' || !cred.line?.configured}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 disabled:opacity-40"
+                >
+                  登録コードを発行
+                </button>
+                <span className="text-[11px] text-slate-500">
+                  {cred.line?.configured ? '公開後、LINEのWebhook設定が済んでから使えます。' : 'LINEのキー設定（npm run setup）が先に必要です。'}
+                </span>
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <p className="text-[11px] text-slate-300">あなたのLINEで、この公式アカウントに次のメッセージを送ってください（10分以内）。</p>
+                <CopyBox label="送るメッセージ" value={regCode.message} />
+                <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                  <RefreshCw className="w-3 h-3 animate-spin" /> 登録を待っています…（届くと自動でこの画面に反映されます）
+                </p>
+              </div>
+            )}
+          </div>
           <label className="text-[11px] font-semibold text-slate-400 block">
-            通知先のLINEユーザーID（「U」から始まる33文字。1行に1つ・最大5件。LINE Developers →「チャネル基本設定」→「あなたのユーザーID」）
+            通知先のLINEユーザーID（自動で入ります。手で入れる場合は「U」から始まる33文字を1行に1つ・最大5件）
           </label>
           <textarea
             rows={2}
@@ -673,12 +829,33 @@ export default function AutoReply({ persona, bossProfile }: Props) {
         </div>
 
         {/* 記録用Webhook（GAS → スプレッドシート） */}
-        <div>
-          <label className="text-[11px] font-semibold text-slate-400">記録用Webhook URL（GAS）… 全受信をスプレッドシートに記録。末尾に ?key=合言葉 を付ける（設定方法はリポジトリの gas/Code.gs）</label>
+        <div className="rounded-xl border border-slate-800 p-3 space-y-2">
+          <div className="text-xs font-semibold text-slate-200">スプレッドシートに全件記録（Google Apps Script）</div>
+          <ol className="text-[11px] text-slate-400 list-decimal list-inside space-y-0.5">
+            <li>下のボタンでコードをコピー（合言葉は入力済み）</li>
+            <li>スプレッドシート →「拡張機能」→「Apps Script」に貼り付けて保存</li>
+            <li>「デプロイ」→「新しいデプロイ」→ ウェブアプリ（実行：自分／アクセス：全員）</li>
+            <li>表示されたURL（…/exec）を下に貼って「設定を保存」</li>
+          </ol>
+          <button
+            onClick={copyGasCode}
+            disabled={busy === 'gas'}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 disabled:opacity-40 flex items-center gap-1.5"
+          >
+            <Copy className="w-3.5 h-3.5" />
+            GASコードをコピー
+          </button>
+          {gasCodeText && (
+            <div className="space-y-1">
+              <p className="text-[11px] text-amber-300">自動コピーできませんでした。下の枠をクリックして全選択（Ctrl/⌘ + A）→ コピーしてください。</p>
+              <textarea readOnly rows={6} className={inputCls + ' font-mono text-[11px]'} value={gasCodeText} onFocus={(e) => e.currentTarget.select()} />
+            </div>
+          )}
+          <label className="text-[11px] font-semibold text-slate-400 block">記録用Webhook URL（GAS のウェブアプリURL。合言葉はアプリが自動で付けます）</label>
           <input
-            className={inputCls + ' mt-1 font-mono text-xs'}
+            className={inputCls + ' font-mono text-xs'}
             value={draft.sheetWebhookUrl || ''}
-            placeholder="https://script.google.com/macros/s/…/exec?key=…"
+            placeholder="https://script.google.com/macros/s/…/exec"
             onChange={(e) => { setDraft({ ...draft, sheetWebhookUrl: e.target.value }); setDirty(true); }}
           />
         </div>

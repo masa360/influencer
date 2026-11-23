@@ -709,3 +709,109 @@ test('保存: 変更は flush() で即座にファイルへ書き出される（
   const saved = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR!, 'db.json'), 'utf8'));
   assert.equal(saved.config.leadScoreThreshold, 55);
 });
+
+// ============================================================ 自動設定（手作業を減らす機能）
+
+const reg = await import('../server/lineRegister.ts');
+const ME = 'U' + 'c'.repeat(32);
+const lineEvent = (text: string, userId = ME, id = String(Math.random())) => ({
+  type: 'message', webhookEventId: 'reg' + id, replyToken: 'rt-' + id, timestamp: Date.now(),
+  source: { type: 'user', userId }, message: { type: 'text', id, text },
+});
+async function sendLine(events: any[]) {
+  const body = { events };
+  const raw = JSON.stringify(body);
+  const r = (await h.lineWebhookPost(req({ body, rawBody: raw, headers: { 'x-line-signature': sign('linesecret', raw, 'base64') } }))) as any;
+  await sleep(30);
+  return r;
+}
+
+test('通知先登録: 管理画面のコードを自分のLINEから送ると登録され、AIには回らない', async () => {
+  setup({ line: 'auto' }, false); // 自動返信が停止中でも登録できる
+  const auth = { authorization: 'Bearer admin-secret' };
+  const issued = (await h.adminLineRegisterCode(req({ headers: auth }))) as any;
+  assert.equal(issued.status, 200);
+  assert.match(issued.body.message, /^通知登録 \d{6}$/);
+
+  // 全角数字・全角スペースでも受け付ける
+  const zenkaku = issued.body.code.replace(/[0-9]/g, (d: string) => String.fromCharCode(d.charCodeAt(0) + 0xfee0));
+  await sendLine([lineEvent(`通知登録　${zenkaku}`)]);
+  const c = store.getConfig().lineNotify;
+  assert.equal(c.enabled, true);
+  assert.deepEqual(c.userIds, [ME]);
+  const reply = calls.find((x) => x.url.endsWith('/v2/bot/message/reply'))!;
+  assert.match(reply.body.messages[0].text, /通知先に登録しました/);
+  assert.equal(genCalls, 0, 'AIは呼ばない');
+  assert.equal(store.listEntries().length, 0, '受信ログにも残さない');
+
+  // 同じコードは2回使えない
+  calls = [];
+  await sendLine([lineEvent(`通知登録 ${issued.body.code}`, 'U' + 'd'.repeat(32))]);
+  assert.match(calls.find((x) => x.url.endsWith('/reply'))!.body.messages[0].text, /有効期限|発行されていません/);
+  assert.equal(store.getConfig().lineNotify.userIds.length, 1);
+});
+
+test('通知先登録: 5回間違えるとコードが無効になる／期限切れは登録しない', () => {
+  setup({ line: 'auto' });
+  const { code } = reg.issueRegistrationCode();
+  const wrong = code === '111111' ? '222222' : '111111';
+  for (let i = 0; i < 5; i++) assert.equal(reg.handleRegistration(`通知登録 ${wrong}`, ME), 'invalid');
+  assert.equal(reg.handleRegistration(`通知登録 ${code}`, ME), 'expired', '5回失敗で無効');
+
+  const t0 = Date.now();
+  const again = reg.issueRegistrationCode(t0);
+  assert.equal(reg.handleRegistration(`通知登録 ${again.code}`, ME, t0 + 11 * 60_000), 'expired');
+  assert.equal(store.getConfig().lineNotify.userIds.length, 0);
+});
+
+test('通知先登録: LINEの設定がないとコードを発行しない', async () => {
+  const keep = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  delete process.env.LINE_CHANNEL_ACCESS_TOKEN;
+  const r = (await h.adminLineRegisterCode(req({ headers: { authorization: 'Bearer admin-secret' } }))) as any;
+  process.env.LINE_CHANNEL_ACCESS_TOKEN = keep;
+  assert.equal(r.status, 400);
+});
+
+test('LINE Webhook自動設定: URL登録→疎通テスト→「Webhookの利用」の状態を返す', async () => {
+  fetchRoutes = [
+    [/webhook\/test$/, () => ({ success: true, statusCode: 200, reason: 'OK' })],
+    [/webhook\/endpoint$/, () => ({ endpoint: 'https://app.example.com/webhooks/line', active: false })],
+  ];
+  const r = (await h.adminLineSetupWebhook(req({ headers: { authorization: 'Bearer admin-secret' } }))) as any;
+  assert.equal(r.status, 200);
+  const put = calls.find((c) => c.url.endsWith('/webhook/endpoint') && c.init?.method === 'PUT')!;
+  assert.equal(put.body.endpoint, 'https://app.example.com/webhooks/line');
+  assert.equal(r.body.result.ok, true);
+  assert.equal(r.body.result.active, false);
+  assert.match(r.body.result.message, /Webhookの利用」をオン/);
+});
+
+test('LINE Webhook自動設定: 疎通テスト失敗・httpのURLはエラーとして伝える', async () => {
+  fetchRoutes = [[/webhook\/test$/, () => ({ success: false, statusCode: 401, reason: 'ERROR_STATUS_CODE' })]];
+  const r = (await h.adminLineSetupWebhook(req({ headers: { authorization: 'Bearer admin-secret' } }))) as any;
+  assert.equal(r.body.result.ok, false);
+  assert.match(r.body.result.message, /疎通テストに失敗/);
+
+  const local = (await h.adminLineSetupWebhook(req({ headers: { authorization: 'Bearer admin-secret' }, baseUrl: 'http://localhost:3000' }))) as any;
+  assert.equal(local.status, 502);
+  assert.match(local.body.error, /https/);
+});
+
+test('GASコード: 合言葉入りで配布され、記録時はURLに合言葉が自動で付く', async () => {
+  setup({ line: 'draft' });
+  const r = (await h.adminGasCode(req({ method: 'GET', headers: { authorization: 'Bearer admin-secret' } }))) as any;
+  assert.equal(r.status, 200);
+  const key = store.getSheetKey();
+  assert.match(key, /^gk_[0-9a-f]{32}$/);
+  assert.ok(r.text.includes(`const SECRET_KEY = '${key}';`));
+  assert.ok(!r.text.includes('ここを長いランダムな文字列に書き換える\';'), '初期値は残らない');
+
+  const url = 'https://script.google.com/macros/s/abc/exec';
+  store.updateConfig({ sheetWebhookUrl: url });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'gk1', senderId: 'U1', text: '相談', ref: {} });
+  await sleep(20);
+  assert.ok(calls.some((c) => c.url === `${url}?key=${key}`));
+  // 手で key を付けたURLはそのまま使う
+  assert.equal(pipeline.sheetUrlWithKey(url + '?key=mine'), url + '?key=mine');
+  assert.equal(pipeline.sheetUrlWithKey('http://insecure.example.com'), '');
+});

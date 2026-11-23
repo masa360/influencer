@@ -38,7 +38,7 @@ test('全ルートが登録されている', () => {
     'GET /widget.js', 'OPTIONS /api/inbound/web', 'POST /api/inbound/web', 'POST /api/v1/reply',
     'GET /api/admin/state', 'PUT /api/admin/config', 'GET /api/admin/inbox',
     'POST /api/admin/inbox/:id/approve', 'POST /api/admin/inbox/:id/reject',
-    'POST /api/admin/test-reply', 'POST /api/admin/keys/rotate', 'POST /api/admin/youtube/poll', 'POST /api/admin/test-notify',
+    'POST /api/admin/test-reply', 'POST /api/admin/keys/rotate', 'POST /api/admin/youtube/poll', 'POST /api/admin/test-notify', 'POST /api/admin/line/register-code', 'POST /api/admin/line/setup-webhook', 'GET /api/admin/gas-code',
   ]) assert.ok(routes.has(k), k);
 });
 

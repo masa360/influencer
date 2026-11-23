@@ -6,6 +6,7 @@ import {
   getConfig,
   getEntry,
   getHistory,
+  getSheetKey,
   isSafeWebhookUrl,
   markSeen,
   newId,
@@ -310,6 +311,20 @@ export function entryPayload(e: Entry) {
 }
 
 /**
+ * 記録用Webhook URL に合言葉（?key=）を付けて返す。すでに key があればそのまま。
+ * 未設定・不正なURLなら空文字。
+ *
+ * @example
+ * sheetUrlWithKey('https://script.google.com/macros/s/xxx/exec'); // '...exec?key=gk_...'
+ */
+export function sheetUrlWithKey(raw: string): string {
+  if (!raw || !isSafeWebhookUrl(raw)) return '';
+  const u = new URL(raw);
+  if (!u.searchParams.has('key')) u.searchParams.set('key', getSheetKey());
+  return u.toString();
+}
+
+/**
  * 受信1件を記録用Webhook（Google Apps Script など）へ送る。
  * 同じ id で何度も送られる（受信時・承認時・却下時）ので、受け側は id で上書き更新する。
  * 受け側のサンプルは gas/Code.gs を参照。
@@ -318,8 +333,8 @@ export function entryPayload(e: Entry) {
  * // 設定「記録用Webhook URL」に GAS のウェブアプリURL（?key=合言葉 付き）を入れると有効になる
  */
 export async function logToSheet(e: Entry): Promise<void> {
-  const url = getConfig().sheetWebhookUrl;
-  if (!url || !isSafeWebhookUrl(url)) return;
+  const url = sheetUrlWithKey(getConfig().sheetWebhookUrl);
+  if (!url) return;
   try {
     await httpJson(
       url,

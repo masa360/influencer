@@ -35,6 +35,7 @@ import {
 } from 'lucide-react';
 import AutoReply from './AutoReply.tsx';
 import { postJson } from './apiClient.ts';
+import { BOSS_FIELD_LABEL, DEFAULT_BOSS, sampleFields } from './sample.ts';
 
 // --- プリセット・テンプレート定義 ---
 interface PersonaTemplate {
@@ -177,15 +178,9 @@ export default function App() {
   // 1. ボス（ユーザー自身）＆集客ゴール設定
   const [bossProfile, setBossProfile] = useState(() => {
     const saved = loadJson<Record<string, string>>(BOSS_STORAGE_KEY);
-    if (saved && typeof saved === 'object') return saved;
-    return {
-      bossName: 'あなた（代表・エグゼクティブコンサルタント）',
-      bossTitle: 'AI×経営改革ストラテジスト',
-      bossStrength: '現場に定着するAI導入と、机上の空論ではない泥臭い利益改善。支援実績100社以上。',
-      targetAudience: '年商1億〜30億円規模の中小企業経営者・次世代アトツギ・役員クラス',
-      ctaGoal: '毎月5社限定の「AI経営・収益倍増60分無料壁打ち（個別相談）」への申込',
-      ctaLinkText: 'プロフィールの公式LINEから「壁打ち」と送信してください'
-    };
+    // 保存済みの値を優先（新しく増えた項目はサンプルで補う）
+    if (saved && typeof saved === 'object') return { ...DEFAULT_BOSS, ...saved };
+    return { ...DEFAULT_BOSS };
   });
 
   // 2. AIインフルエンサー・ペルソナ設定
@@ -284,6 +279,47 @@ export default function App() {
     saveJson(PERSONA_STORAGE_KEY, persona);
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 2500);
+  };
+
+  /**
+   * AIキャラ＆ボス設定を、別のブラウザ（例：公開したアプリ）へ移すために書き出す／読み込む。
+   * 手元で入力した内容を、公開版でもう一度入力し直さなくて済むようにする。
+   */
+  const [transferMsg, setTransferMsg] = useState('');
+  const handleExportSettings = async () => {
+    const data = JSON.stringify({ type: 'leadgen-settings', v: 1, bossProfile, persona });
+    try {
+      await navigator.clipboard.writeText(data);
+      setTransferMsg('✅ 設定をコピーしました。移したい先の画面で「貼り付けて読み込む」を押してください。');
+    } catch {
+      window.prompt('自動でコピーできませんでした。下の文字列をすべてコピーしてください。', data);
+    }
+  };
+  const handleImportSettings = async () => {
+    let text = '';
+    try {
+      text = await navigator.clipboard.readText();
+    } catch {
+      /* 読み取りが許可されない環境では手で貼ってもらう */
+    }
+    if (!text || !text.includes('leadgen-settings')) {
+      text = window.prompt('「設定をコピー」でコピーした文字列を貼り付けてください') || '';
+    }
+    try {
+      const d = JSON.parse(text);
+      if (d?.type !== 'leadgen-settings' || !d.bossProfile || !d.persona?.name) throw new Error('形式が違います');
+      setBossProfile({ ...DEFAULT_BOSS, ...d.bossProfile });
+      setPersona({ ...(PERSONA_TEMPLATES.find((t) => t.id === d.persona.id) || PERSONA_TEMPLATES[0]), ...d.persona });
+      setSelectedTemplateId(d.persona.id || PERSONA_TEMPLATES[0].id);
+      setTransferMsg('✅ 設定を読み込みました。');
+    } catch {
+      if (text) setTransferMsg('⚠️ 読み込めませんでした。「設定をコピー」でコピーした文字列をそのまま貼り付けてください。');
+    }
+  };
+  /** サーバーに反映済みの設定を、この画面に読み込む（公開版を別のブラウザで開いたとき用） */
+  const handleLoadFromServer = (b: Record<string, string>, p: Record<string, string>) => {
+    setBossProfile({ ...DEFAULT_BOSS, ...b });
+    setPersona((cur) => ({ ...cur, ...p }));
   };
 
   // テンプレート切り替え
@@ -1117,7 +1153,25 @@ ${generatedPack.imagePromptJa}
                 )}
               </div>
 
+              {sampleFields(bossProfile).length > 0 && (
+                <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200 leading-relaxed">
+                  ⚠️ <strong>「{sampleFields(bossProfile).map((k) => BOSS_FIELD_LABEL[k]).join('」「')}」</strong>がサンプル（【例】・〇〇）のままです。
+                  AIはここに書いた内容だけを使って話すので、<strong>あなたの本当の情報</strong>に書き換えてください（実在しない実績を書くと景品表示法に触れるおそれがあります）。
+                </div>
+              )}
+
               <div className="space-y-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">あなたのお名前・屋号（AIが「〇〇の公式AI」と名乗るときに使います）</label>
+                  <input
+                    type="text"
+                    value={bossProfile.bossName || ''}
+                    placeholder="例：山田 太郎（代表） / 株式会社〇〇"
+                    onChange={(e) => setBossProfile({ ...bossProfile, bossName: e.target.value })}
+                    className="w-full rounded-xl bg-slate-950 border border-slate-800 p-2.5 text-sm text-white focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">あなたの呼称・肩書き</label>
                   <input
@@ -1172,7 +1226,23 @@ ${generatedPack.imagePromptJa}
                   />
                 </div>
 
-                <div className="pt-2 flex justify-end">
+                <div className="pt-2 flex flex-wrap items-center justify-end gap-2">
+                  {transferMsg && <span className="text-[11px] text-slate-300 mr-auto">{transferMsg}</span>}
+                  <button
+                    onClick={handleExportSettings}
+                    title="手元で入力した設定を、公開したアプリなど別の画面に移すときに使います"
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <Copy className="w-3.5 h-3.5 text-amber-400" />
+                    <span>設定をコピー</span>
+                  </button>
+                  <button
+                    onClick={handleImportSettings}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <Download className="w-3.5 h-3.5 text-amber-400" />
+                    <span>貼り付けて読み込む</span>
+                  </button>
                   <button
                     onClick={handleSaveSettings}
                     className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition-colors"
@@ -1398,7 +1468,7 @@ ${generatedPack.imagePromptJa}
         )}
 
         {/* ==================== TAB 4: 週間運用＆集客ファネルROI試算 ==================== */}
-        {activeTab === 'auto' && <AutoReply persona={persona} bossProfile={bossProfile} />}
+        {activeTab === 'auto' && <AutoReply persona={persona} bossProfile={bossProfile} onLoadFromServer={handleLoadFromServer} />}
 
         {activeTab === 'funnel' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
