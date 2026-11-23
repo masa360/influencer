@@ -199,3 +199,87 @@ test('Windows 用の引数クォート', () => {
   assert.equal(deployer.quoteWin('C:\\Users\\Taro Yamada\\env.yaml'), '"C:\\Users\\Taro Yamada\\env.yaml"');
   assert.equal(deployer.quoteWin('--quiet'), '--quiet');
 });
+
+// ============================================================ 導入代行（お客様ごとに1サーバー）
+
+const customers: any = await import('../scripts/lib/customers.mjs');
+const tmpRoot = () => fs.mkdtempSync(path.join(os.tmpdir(), 'leadgen-cust-'));
+
+test('お客様: 会社名のルール（小文字英数字とハイフン・20文字・予約語は不可）', () => {
+  assert.equal(customers.validateName('acme'), 'acme');
+  assert.equal(customers.validateName('tanaka-office-2'), 'tanaka-office-2');
+  for (const bad of ['', 'Acme', 'acme corp', '株式会社', '-acme', 'a_b', 'a'.repeat(21), 'all', 'default']) {
+    assert.throws(() => customers.validateName(bad), customers.CustomerError, bad);
+  }
+});
+
+test('お客様: コマンド引数の読み取り（自分用 / 会社名 / all）', () => {
+  assert.deepEqual(customers.parseTarget([]), { kind: 'default' });
+  assert.deepEqual(customers.parseTarget(['acme']), { kind: 'customer', name: 'acme' });
+  assert.deepEqual(customers.parseTarget(['all']), { kind: 'all' });
+  assert.deepEqual(customers.parseTarget(['--verbose', 'acme']), { kind: 'customer', name: 'acme' });
+  assert.throws(() => customers.parseTarget(['a', 'b']), /1つだけ/);
+  assert.throws(() => customers.parseTarget(['A B']), customers.CustomerError);
+});
+
+test('お客様: メモの保存・マージ・一覧（変な名前のファイルは無視）', () => {
+  const root = tmpRoot();
+  assert.deepEqual(customers.listCustomers(root), []);
+  const p = customers.customerPaths(root, 'acme');
+  fs.mkdirSync(p.dir, { recursive: true });
+  fs.writeFileSync(p.env, 'GEMINI_API_KEY="k"\n');
+  fs.writeFileSync(path.join(p.dir, 'Bad Name.env'), '');
+  fs.writeFileSync(customers.customerPaths(root, 'zeta').env, '');
+
+  customers.writeMeta(root, 'acme', { project: 'proj-a' });
+  customers.writeMeta(root, 'acme', { url: 'https://acme.run.app' });
+  assert.deepEqual(customers.readMeta(root, 'acme'), { project: 'proj-a', url: 'https://acme.run.app', name: 'acme' });
+  assert.deepEqual(customers.readMeta(root, 'nobody'), {});
+  assert.deepEqual(customers.listCustomers(root).map((c: any) => c.name), ['acme', 'zeta']);
+});
+
+test('お客様: 鍵の入った customers/ は GitHub・Cloud Build・Docker の対象から除外されている', () => {
+  const repo = path.join(import.meta.dirname, '..');
+  const has = (file: string, re: RegExp) => re.test(fs.readFileSync(path.join(repo, file), 'utf8'));
+  assert.ok(has('.gitignore', /^customers\/$/m), '.gitignore');
+  assert.ok(has('.gcloudignore', /^customers$/m), '.gcloudignore（他のお客様の鍵をアップロードしない）');
+  assert.ok(has('.dockerignore', /^customers$/m), '.dockerignore');
+});
+
+test('デプロイ（お客様用）: サービス名・バケット名がお客様ごとに分かれ、指定したプロジェクトを使う', async () => {
+  const g = fakeGcloud();
+  const r = await deployer.deploy({
+    run: g.run, env: ENV, root: '/repo', customer: 'acme', project: 'client-proj',
+    fetchImpl: fakeFetch().f, log: () => {}, sleep: async () => {},
+  });
+  const dep = g.calls.find((c) => c[0] === 'run' && c[1] === 'deploy')!;
+  assert.equal(dep[2], 'leadgen-acme');
+  assert.ok(dep.includes('client-proj'));
+  assert.ok(dep.includes('name=data,type=cloud-storage,bucket=client-proj-leadgen-acme'));
+  assert.equal(r.service, 'leadgen-acme');
+  assert.equal(r.bucket, 'client-proj-leadgen-acme');
+  assert.equal(r.project, 'client-proj');
+  // gcloud の「選択中のプロジェクト」は使わない
+  assert.ok(!g.calls.some((c) => c.join(' ') === 'config get-value project'));
+  // 自分用の既定は従来どおり
+  assert.equal(deployer.serviceNameFor(''), 'leadgen-agent');
+  assert.equal(deployer.bucketNameFor('p'), 'p-leadgen-data');
+});
+
+test('デプロイ（お客様用）: 準備不足のメッセージにお客様用のコマンドが出る', async () => {
+  const g = fakeGcloud();
+  await assert.rejects(
+    deployer.deploy({ run: g.run, env: { ...ENV, GEMINI_API_KEY: '' }, root: '/repo', customer: 'acme', fetchImpl: fakeFetch().f, log: () => {}, sleep: async () => {} }),
+    /customers\/acme\.env.*npm run setup acme/s
+  );
+  const g2 = fakeGcloud({ enableFails: true });
+  await assert.rejects(
+    deployer.deploy({ run: g2.run, env: ENV, root: '/repo', customer: 'acme', project: 'not-mine', fetchImpl: fakeFetch().f, log: () => {}, sleep: async () => {} }),
+    /オーナー.*not-mine|not-mine.*オーナー/s
+  );
+});
+
+test('お客様用の長い名前でもバケット名は63文字以内', () => {
+  const longest = deployer.bucketNameFor('p'.repeat(30), 'x'.repeat(customers.MAX_NAME_LENGTH));
+  assert.ok(longest.length <= 63, String(longest.length));
+});

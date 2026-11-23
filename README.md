@@ -23,6 +23,19 @@
 
 > 自動返信はブラウザを閉じていてもサーバー上で動きます。そのため、AIキャラ／ボス設定は「自動返信」タブの「現在の設定をサーバーに反映」でサーバーに保存されます。
 
+## 他の人に提供する（導入代行：お客様ごとに1サーバー）
+お客様ごとに、サーバー・データ・鍵・管理トークンを分けて提供できます（1社の導入は慣れれば30〜60分）。
+
+| コマンド | 内容 |
+|---|---|
+| `npm run setup 会社名` | お客様の鍵を入れる（`customers/会社名.env`。GitHub・サーバーには上がらない） |
+| `npm run deploy 会社名` | そのお客様のサーバーを公開／更新（サービス名 `leadgen-会社名`、保存先バケットもお客様ごと） |
+| `npm run deploy all` | 全社をまとめて更新（1社失敗しても残りは続ける） |
+| `npm run customers` | 登録済みのお客様と公開URLの一覧 |
+
+- 提供する側向け：[docs/VENDOR_GUIDE.md](docs/VENDOR_GUIDE.md)／質問票：[docs/ONBOARDING_SHEET.md](docs/ONBOARDING_SHEET.md)／お客様向けの手引：[docs/CUSTOMER_GUIDE.md](docs/CUSTOMER_GUIDE.md)／利用条件のひな形：[docs/TERMS_TEMPLATE.md](docs/TERMS_TEMPLATE.md)
+- 1つのサーバーを複数のお客様で共有する方式（マルチテナント）は未対応です。需要が確認できてから作る想定です。
+
 ## 自動化している作業
 
 | 以前は手作業だったこと | いまは |

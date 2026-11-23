@@ -8,3 +8,6 @@ coverage/
 !.env.example
 data/
 env.yaml
+
+# お客様ごとの鍵・メモ（秘密。導入代行用）
+customers/

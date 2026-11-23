@@ -46,8 +46,18 @@ export function toEnvYaml(vars) {
     .join('\n') + '\n';
 }
 
-/** プロジェクトIDからデータ保存用バケット名を決める */
-export const bucketNameFor = (project) => `${project}-leadgen-data`.toLowerCase();
+/**
+ * プロジェクトID（と会社名）からデータ保存用バケット名を決める。
+ * @param {string} project Google Cloud のプロジェクトID
+ * @param {string} [customer] 会社名（省略時は自分用の `data`）
+ * @example
+ * bucketNameFor('my-proj');         // 'my-proj-leadgen-data'
+ * bucketNameFor('my-proj', 'acme'); // 'my-proj-leadgen-acme'
+ */
+export const bucketNameFor = (project, customer) => `${project}-leadgen-${customer || 'data'}`.toLowerCase();
+
+/** 会社名から Cloud Run のサービス名を決める（省略時は自分用の leadgen-agent） */
+export const serviceNameFor = (customer) => (customer ? `leadgen-${customer}` : 'leadgen-agent');
 
 /**
  * デプロイを実行する。
@@ -57,16 +67,18 @@ export const bucketNameFor = (project) => `${project}-leadgen-data`.toLowerCase(
  * @param {Record<string, string>} o.env    parseEnv した .env
  * @param {string} o.root                   リポジトリのルート（--source に渡す）
  * @param {string} [o.region]               既定 asia-northeast1（東京）
- * @param {string} [o.service]              既定 leadgen-agent
+ * @param {string} [o.customer]             会社名（導入代行用。サービス名・バケット名がお客様ごとに分かれる）
+ * @param {string} [o.project]              使う Google Cloud プロジェクトID（省略時は gcloud で選択中のもの）
+ * @param {string} [o.service]              サービス名（省略時は会社名から自動で決まる）
  * @param {typeof fetch} [o.fetchImpl]
  * @param {(s: string) => void} [o.log]
  * @param {number} [o.healthTries]          動作確認の試行回数（既定 20 回 × 3 秒）
- * @returns {Promise<{ url: string, bucket: string, project: string, line: null | { ok: boolean, active: boolean | null, message: string } }>}
+ * @returns {Promise<{ url: string, bucket: string, project: string, region: string, service: string, line: null | { ok: boolean, active: boolean | null, message: string } }>}
  */
 export async function deploy(o) {
   const log = o.log || console.log;
   const region = o.region || 'asia-northeast1';
-  const service = o.service || 'leadgen-agent';
+  const service = o.service || serviceNameFor(o.customer);
   const fetchImpl = o.fetchImpl || fetch;
   const sleep = o.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
 
@@ -88,27 +100,30 @@ export async function deploy(o) {
   }
   const account = gc(['config', 'get-value', 'account'], { capture: true, allowFail: true }).stdout.trim();
   if (!account || account === '(unset)') throw new DeployError('Google アカウントでログインしていません。次を実行してください:\n  gcloud auth login');
-  const project = gc(['config', 'get-value', 'project'], { capture: true, allowFail: true }).stdout.trim();
+  const project = (o.project || gc(['config', 'get-value', 'project'], { capture: true, allowFail: true }).stdout.trim()).trim();
   if (!project || project === '(unset)') {
     throw new DeployError('使う Google Cloud プロジェクトが選ばれていません。次を実行してください（IDはコンソールの上部で確認）:\n  gcloud config set project あなたのプロジェクトID');
   }
-  if (!o.env.GEMINI_API_KEY) throw new DeployError('.env に GEMINI_API_KEY がありません。先に npm run setup を実行してください。');
-  if (!o.env.ADMIN_TOKEN || o.env.ADMIN_TOKEN.length < 16) throw new DeployError('.env に ADMIN_TOKEN がありません。先に npm run setup を実行してください。');
+  const setupCmd = o.customer ? `npm run setup ${o.customer}` : 'npm run setup';
+  const envName = o.customer ? `customers/${o.customer}.env` : '.env';
+  if (!o.env.GEMINI_API_KEY) throw new DeployError(`${envName} に GEMINI_API_KEY がありません。先に ${setupCmd} を実行してください。`);
+  if (!o.env.ADMIN_TOKEN || o.env.ADMIN_TOKEN.length < 16) throw new DeployError(`${envName} に ADMIN_TOKEN がありません。先に ${setupCmd} を実行してください。`);
   log(`  ✅ アカウント: ${account}`);
   log(`  ✅ プロジェクト: ${project}（リージョン: ${region}）`);
+  if (o.customer) log(`  ✅ お客様: ${o.customer}（サービス名: ${service}）`);
 
   // ---- 1. API の有効化 ----
   log('\n② 必要な機能（API）を有効化しています…（初回は1〜2分かかります）');
   const en = gc(['services', 'enable', ...REQUIRED_APIS, '--project', project], { allowFail: true });
   if (en.code !== 0) {
     throw new DeployError(
-      'API を有効化できませんでした。Google Cloud コンソールの「お支払い」で、このプロジェクトに請求先アカウント（課金）が設定されているか確認してください。'
+      `API を有効化できませんでした。次を確認してください。\n  ・プロジェクトID「${project}」が正しいか\n  ・今ログインしているアカウント（${account}）に、そのプロジェクトの「オーナー」権限があるか\n  ・Google Cloud コンソールの「お支払い」で、そのプロジェクトに請求先アカウント（課金）が設定されているか`
     );
   }
   log('  ✅ 有効化しました');
 
   // ---- 2. データ保存用バケット ----
-  const bucket = bucketNameFor(project);
+  const bucket = bucketNameFor(project, o.customer);
   log(`\n③ データ保存用のバケット（gs://${bucket}）`);
   if (gc(['storage', 'buckets', 'describe', `gs://${bucket}`, '--format=value(name)', '--project', project], { capture: true, allowFail: true }).code === 0) {
     log('  ✅ 作成済みのものを使います');
@@ -210,7 +225,7 @@ export async function deploy(o) {
     log(`  ${line.ok && line.active !== false ? '✅' : '⚠️'} ${line.message}`);
   }
 
-  return { url, bucket, project, line };
+  return { url, bucket, project, region, service, line };
 }
 
 /**
