@@ -1,5 +1,5 @@
 import type { Inbound } from './channels.ts';
-import { sendReply } from './channels.ts';
+import { pushLineToOwners, sendReply } from './channels.ts';
 import { generateReply } from './agent.ts';
 import {
   addHistory,
@@ -56,6 +56,7 @@ export async function processInbound(inb: Inbound): Promise<Entry> {
     Object.assign(entry, patch);
     saveEntry(entry);
     void notifyIfNeeded(entry);
+    void logToSheet(entry);
     return entry;
   };
 
@@ -145,6 +146,7 @@ export async function approveEntry(id: string, replyOverride?: string): Promise<
   e.note = e.viaApi ? '承認済み（API経由のため配信は呼び出し側）' : '承認して送信';
   addHistory(e.conversationKey, { sender: 'influencer', text });
   saveEntry(e);
+  void logToSheet(e);
   return e;
 }
 
@@ -154,6 +156,7 @@ export function rejectEntry(id: string): Entry {
   if (!['drafted', 'needs_human', 'error'].includes(e.status)) throw new HttpError(409, `status=${e.status} は却下できません`);
   e.status = 'rejected';
   saveEntry(e);
+  void logToSheet(e);
   return e;
 }
 
@@ -163,42 +166,101 @@ export class HttpError extends Error {
   }
 }
 
-/** 高スコアのリード/要人間対応をSlack・Discord・Make等のWebhookへ通知（任意） */
-async function notifyIfNeeded(e: Entry) {
+/** 通知の対象か（見込み度が閾値以上、または要人間対応） */
+function shouldNotify(e: Entry): boolean {
   const cfg = getConfig();
+  if (e.status === 'needs_human') return true;
+  return (e.leadScore ?? 0) >= cfg.leadScoreThreshold && e.status !== 'skipped' && e.status !== 'error';
+}
+
+/** 通知本文（LINE・Slack・Discord 共通） */
+export function buildNotifyText(e: Entry): string {
+  const label = e.status === 'needs_human' ? '🙋 要人間対応' : `🔥 見込み客（スコア${e.leadScore}）`;
+  const appUrl = process.env.APP_URL && !/^MY_APP_URL$/.test(process.env.APP_URL) ? process.env.APP_URL.replace(/\/$/, '') : '';
+  return [
+    `${label}`,
+    `[${e.channel}] ${e.senderName || e.senderId}`,
+    `「${e.text.slice(0, 200)}」`,
+    e.reply ? `\n返信案：${e.reply.slice(0, 200)}` : '',
+    appUrl ? `\n受信ログで確認 → ${appUrl}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+/**
+ * 高スコアのリード/要人間対応を通知する（任意）。
+ * - 運営者のLINE（設定「LINE通知」）
+ * - 通知先Webhook（Slack / Discord など）
+ */
+async function notifyIfNeeded(e: Entry) {
+  if (!shouldNotify(e)) return;
+  const cfg = getConfig();
+  const text = buildNotifyText(e);
+
+  if (cfg.lineNotify.enabled && cfg.lineNotify.userIds.length) {
+    try {
+      await pushLineToOwners(cfg.lineNotify.userIds, text);
+    } catch (err) {
+      console.warn('[notify:line] failed:', (err as Error).message);
+    }
+  }
+
   const url = cfg.notifyWebhookUrl;
   if (!url || !isSafeWebhookUrl(url)) return;
-  const isLead = (e.leadScore ?? 0) >= cfg.leadScoreThreshold && e.status !== 'skipped' && e.status !== 'error';
-  if (!isLead && e.status !== 'needs_human') return;
-  const label = e.status === 'needs_human' ? '🙋 要人間対応' : `🔥 見込み客 (スコア${e.leadScore})`;
-  const summary = `${label} [${e.channel}/${e.kind}] ${e.senderName || e.senderId}\n> ${e.text.slice(0, 200)}${
-    e.reply ? `\n返信案: ${e.reply.slice(0, 200)}` : ''
-  }`;
   try {
     await httpJson(
       url,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // Slack(text) / Discord(content) / Make・Zapier(その他のフィールド) 共用
-        body: JSON.stringify({
-          text: summary,
-          content: summary,
-          id: e.id,
-          channel: e.channel,
-          kind: e.kind,
-          status: e.status,
-          leadScore: e.leadScore,
-          intent: e.intent,
-          sender: { id: e.senderId, name: e.senderName, email: e.email },
-          message: e.text,
-          reply: e.reply,
-          source: e.source,
-        }),
+        // Slack(text) / Discord(content) / その他(その他のフィールド) 共用
+        body: JSON.stringify({ text, content: text, ...entryPayload(e) }),
       },
       5000
     );
   } catch (err) {
     console.warn('[notify] failed:', (err as Error).message);
+  }
+}
+
+/** Webhookに送る受信1件分のデータ */
+export function entryPayload(e: Entry) {
+  return {
+    id: e.id,
+    createdAt: e.createdAt,
+    updatedAt: new Date().toISOString(),
+    channel: e.channel,
+    kind: e.kind,
+    status: e.status,
+    leadScore: e.leadScore ?? null,
+    intent: e.intent ?? null,
+    sender: { id: e.senderId, name: e.senderName ?? '', email: e.email ?? '' },
+    message: e.text,
+    reply: e.reply ?? '',
+    note: e.note ?? '',
+    source: e.source ?? {},
+  };
+}
+
+/**
+ * 受信1件を記録用Webhook（Google Apps Script など）へ送る。
+ * 同じ id で何度も送られる（受信時・承認時・却下時）ので、受け側は id で上書き更新する。
+ * 受け側のサンプルは gas/Code.gs を参照。
+ *
+ * @example
+ * // 設定「記録用Webhook URL」に GAS のウェブアプリURL（?key=合言葉 付き）を入れると有効になる
+ */
+export async function logToSheet(e: Entry): Promise<void> {
+  const url = getConfig().sheetWebhookUrl;
+  if (!url || !isSafeWebhookUrl(url)) return;
+  try {
+    await httpJson(
+      url,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entryPayload(e)) },
+      10_000
+    );
+  } catch (err) {
+    console.warn('[sheet] failed:', (err as Error).message);
   }
 }

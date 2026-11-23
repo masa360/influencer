@@ -76,4 +76,5 @@ export function registerRoutes(app: Express) {
   app.post('/api/admin/test-reply', adapt(h.adminTestReply));
   app.post('/api/admin/keys/rotate', adapt(h.adminRotateKey));
   app.post('/api/admin/youtube/poll', adapt(h.adminYoutubePoll));
+  app.post('/api/admin/test-notify', adapt(h.adminTestNotify));
 }

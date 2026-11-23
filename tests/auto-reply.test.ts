@@ -514,3 +514,97 @@ test('システム指示: 運営者の公式AIであることを隠さない', (
 test('InstagramのDMは1000バイトに収まる', () => {
   assert.ok(Buffer.byteLength(util.clipBytes('あ'.repeat(500), 1000), 'utf8') <= 1000);
 });
+
+// ============================================================ LINE通知・GAS記録
+
+const OWNER = 'U' + 'a'.repeat(32);
+
+test('LINE通知の設定: 不正なIDは捨て、重複除去・最大5件', () => {
+  const ids = [OWNER, OWNER, 'bad', 'U123', ...Array.from({ length: 6 }, (_, i) => 'U' + String(i).repeat(32))];
+  store.updateConfig({ lineNotify: { enabled: true, userIds: ids } });
+  const c = store.getConfig().lineNotify;
+  assert.equal(c.enabled, true);
+  assert.equal(c.userIds.length, 5);
+  assert.equal(c.userIds[0], OWNER);
+  assert.ok(c.userIds.every((v) => store.isLineUserId(v)));
+});
+
+test('LINE通知: 高スコアのリードは運営者のLINEにmulticastで届く', async () => {
+  setup({ line: 'draft' });
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER] }, leadScoreThreshold: 70 });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'ln1', senderId: 'U1', senderName: '山田', text: '導入の相談をしたい', ref: {} });
+  await sleep(20);
+  const m = calls.find((c) => c.url.endsWith('/v2/bot/message/multicast'))!;
+  assert.ok(m, 'multicast が呼ばれる');
+  assert.deepEqual(m.body.to, [OWNER]);
+  assert.match(m.body.messages[0].text, /見込み客（スコア80）/);
+  assert.match(m.body.messages[0].text, /導入の相談をしたい/);
+});
+
+test('LINE通知: 低スコアは通知しない／オフなら通知しない', async () => {
+  setup({ line: 'draft' });
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER] }, leadScoreThreshold: 70 });
+  genImpl = () => ({ reply: 'ありがとうございます', intent: 'praise', needsHuman: false, leadScore: 10, shouldReply: true });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'ln2', senderId: 'U1', text: 'いつも見てます', ref: {} });
+  store.updateConfig({ lineNotify: { enabled: false } });
+  genImpl = () => ({ reply: 'ok', intent: 'lead', needsHuman: false, leadScore: 90, shouldReply: true });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'ln3', senderId: 'U2', text: '相談したい', ref: {} });
+  await sleep(20);
+  assert.equal(calls.filter((c) => c.url.endsWith('/multicast')).length, 0);
+});
+
+test('LINE通知: 要人間対応はスコアに関係なく通知', async () => {
+  setup({ line: 'auto' });
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER] } });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'ln4', senderId: 'U1', text: '返金してください', ref: {} });
+  await sleep(20);
+  const m = calls.find((c) => c.url.endsWith('/multicast'))!;
+  assert.match(m.body.messages[0].text, /要人間対応/);
+});
+
+test('GAS記録: 受信時と承認時に同じidで送られ、状態が更新される', async () => {
+  setup({ line: 'draft' });
+  const url = 'https://script.google.com/macros/s/abc/exec?key=secret';
+  store.updateConfig({ sheetWebhookUrl: url });
+  const e = await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'gs1', senderId: 'U1', senderName: '山田', text: '相談したい', ref: {} });
+  await sleep(20);
+  await pipeline.approveEntry(e.id);
+  await sleep(20);
+  const logs = calls.filter((c) => c.url === url);
+  assert.equal(logs.length, 2);
+  assert.equal(logs[0].body.id, e.id);
+  assert.equal(logs[0].body.status, 'drafted');
+  assert.equal(logs[0].body.sender.name, '山田');
+  assert.equal(logs[1].body.id, e.id);
+  assert.equal(logs[1].body.status, 'sent');
+});
+
+test('GAS記録: 内部アドレスや http は設定できない', () => {
+  store.updateConfig({ sheetWebhookUrl: 'http://script.google.com/x' });
+  assert.equal(store.getConfig().sheetWebhookUrl, '');
+  store.updateConfig({ sheetWebhookUrl: 'https://127.0.0.1/x' });
+  assert.equal(store.getConfig().sheetWebhookUrl, '');
+});
+
+test('テスト送信API: 未設定なら理由を返し、設定済みなら送信して成否を返す', async () => {
+  const auth = { authorization: 'Bearer admin-secret' };
+  const r1 = (await h.adminTestNotify(req({ headers: auth }))) as any;
+  assert.equal(r1.body.result.line.ok, false);
+  assert.equal(r1.body.result.sheet.ok, false);
+
+  const url = 'https://script.google.com/macros/s/abc/exec?key=secret';
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER] }, sheetWebhookUrl: url });
+  const r2 = (await h.adminTestNotify(req({ headers: auth }))) as any;
+  assert.equal(r2.body.result.line.ok, true);
+  assert.equal(r2.body.result.sheet.ok, true);
+  assert.ok(calls.some((c) => c.url.endsWith('/multicast') && c.body.messages[0].text.startsWith('【テスト通知】')));
+
+  // GAS が合言葉違いを返した場合はエラーとして表示
+  fetchRoutes = [[/script\.google\.com/, () => ({ ok: false, error: 'invalid_key' })]];
+  const r3 = (await h.adminTestNotify(req({ headers: auth }))) as any;
+  assert.equal(r3.body.result.sheet.ok, false);
+  assert.match(r3.body.result.sheet.message, /invalid_key/);
+
+  // 管理トークンなしは401
+  assert.equal(((await h.adminTestNotify(req({}))) as any).status, 401);
+});

@@ -1,5 +1,7 @@
 import {
   CHANNEL_IDS,
+  isSafeWebhookUrl,
+  newId,
   getApiKey,
   getConfig,
   listEntries,
@@ -12,17 +14,18 @@ import {
 } from './store.ts';
 import {
   credentialStatus,
+  pushLineToOwners,
   parseLine,
   parseMeta,
   verifyLine,
   verifyMeta,
   type Inbound,
 } from './channels.ts';
-import { approveEntry, HttpError, processInbound, rejectEntry } from './pipeline.ts';
+import { approveEntry, buildNotifyText, entryPayload, HttpError, processInbound, rejectEntry } from './pipeline.ts';
 import { generateReply } from './agent.ts';
 import { pollYouTubeOnce } from './youtube.ts';
 import { WIDGET_JS } from './widget.ts';
-import { cleanInput, safeEqual, tryConsume } from './util.ts';
+import { cleanInput, httpJson, safeEqual, tryConsume } from './util.ts';
 
 export interface Req {
   method: string;
@@ -332,4 +335,72 @@ export const adminYoutubePoll: Handler = guarded(async () => {
   } catch (e) {
     return err(502, (e as Error).message);
   }
+});
+
+/**
+ * 「テスト送信」: 保存済みの LINE通知 / 記録用Webhook に、サンプル1件を実際に送って結果を返す。
+ * 本番の通知はバックグラウンドで失敗を握りつぶすため、設定確認はこちらで行う。
+ */
+export const adminTestNotify: Handler = guarded(async () => {
+  const cfg = getConfig();
+  const now = new Date().toISOString();
+  const sample = {
+    id: 'test_' + newId(),
+    createdAt: now,
+    channel: 'line' as ChannelId,
+    kind: 'dm' as Kind,
+    senderId: 'test-user',
+    senderName: 'テスト送信',
+    text: 'これは設定確認用のテストです。',
+    reply: '（テスト）返信案がここに入ります',
+    intent: 'lead',
+    leadScore: 99,
+    status: 'drafted' as const,
+    note: 'テスト送信',
+    ref: {},
+    conversationKey: 'test',
+  };
+  const result: Record<string, { ok: boolean; message: string }> = {};
+
+  if (!cfg.lineNotify.enabled || !cfg.lineNotify.userIds.length) {
+    result.line = { ok: false, message: 'LINE通知がオフ、またはユーザーIDが未設定です' };
+  } else {
+    try {
+      await pushLineToOwners(cfg.lineNotify.userIds, '【テスト通知】\n' + buildNotifyText(sample));
+      result.line = { ok: true, message: `${cfg.lineNotify.userIds.length}件のLINEに送信しました` };
+    } catch (e) {
+      result.line = { ok: false, message: (e as Error).message };
+    }
+  }
+
+  if (!cfg.sheetWebhookUrl || !isSafeWebhookUrl(cfg.sheetWebhookUrl)) {
+    result.sheet = { ok: false, message: '記録用Webhook URLが未設定です' };
+  } else {
+    try {
+      const r = await httpJson(
+        cfg.sheetWebhookUrl,
+        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(entryPayload(sample)) },
+        10_000
+      );
+      // gas/Code.gs は { ok: true } / { ok: false, error } を返す
+      if (r && typeof r === 'object' && r.ok === true) {
+        result.sheet = { ok: true, message: 'スプレッドシートに記録しました（テスト行を確認してください）' };
+      } else if (r && typeof r === 'object' && r.ok === false) {
+        result.sheet = { ok: false, message: 'GAS側でエラー: ' + String(r.error || '不明') };
+      } else {
+        result.sheet = {
+          ok: false,
+          message: 'GASから想定外の応答でした。デプロイ時の「アクセスできるユーザー」が「全員」になっているか、URLが「/exec」で終わっているか確認してください',
+        };
+      }
+    } catch (e) {
+      const msg = (e as Error).message;
+      result.sheet = {
+        ok: false,
+        message: /fetch failed|aborted|timeout/i.test(msg) ? 'GASのURLに接続できませんでした。URLが正しいか確認してください' : msg,
+      };
+    }
+  }
+
+  return ok({ result });
 });

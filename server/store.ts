@@ -38,6 +38,10 @@ export interface Config {
   disclosure: { enabled: boolean; text: string };
   handoffKeywords: string[];
   notifyWebhookUrl: string;
+  /** 見込み客・要人間対応を、運営者自身のLINEにプッシュ通知する */
+  lineNotify: { enabled: boolean; userIds: string[] };
+  /** 全受信をGoogleスプレッドシート等に記録するWebhook（Google Apps Script のウェブアプリURLを想定） */
+  sheetWebhookUrl: string;
   leadScoreThreshold: number;
   updatedAt: string;
 }
@@ -119,6 +123,8 @@ export function defaultConfig(): Config {
     disclosure: { enabled: true, text: '（運営者公式のAIアシスタントによる自動返信です）' },
     handoffKeywords: ['返金', '解約', 'クレーム', '訴訟', '弁護士', '警察', '詐欺', '訴える', '被害'],
     notifyWebhookUrl: '',
+    lineNotify: { enabled: false, userIds: [] },
+    sheetWebhookUrl: '',
     leadScoreThreshold: 70,
     updatedAt: '',
   };
@@ -157,6 +163,7 @@ function load(): DB {
       web: { ...base.config.web, ...(cfg.web || {}) },
       limits: { ...base.config.limits, ...(cfg.limits || {}) },
       disclosure: { ...base.config.disclosure, ...(cfg.disclosure || {}) },
+      lineNotify: { ...base.config.lineNotify, ...(cfg.lineNotify || {}) },
     };
     base.log = Array.isArray(parsed.log) ? parsed.log : [];
     base.seen = Array.isArray(parsed.seen) ? parsed.seen : [];
@@ -246,6 +253,17 @@ export function isSafeWebhookUrl(u: string): boolean {
   }
 }
 
+/**
+ * LINEのユーザーIDの形式か（「U」＋32桁の16進数）。
+ * LINE Developers の「チャネル基本設定」→「あなたのユーザーID」に表示される値。
+ *
+ * @example
+ * isLineUserId('U' + '0'.repeat(32)); // true
+ */
+export function isLineUserId(v: string): boolean {
+  return /^U[0-9a-f]{32}$/.test(v);
+}
+
 export function updateConfig(patch: any): Config {
   const d = load();
   const c = d.config;
@@ -326,6 +344,25 @@ export function updateConfig(patch: any): Config {
     const u = patch.notifyWebhookUrl.trim();
     if (u === '' || isSafeWebhookUrl(u)) c.notifyWebhookUrl = u;
   }
+  if (patch.lineNotify && typeof patch.lineNotify === 'object') {
+    if (typeof patch.lineNotify.enabled === 'boolean') c.lineNotify.enabled = patch.lineNotify.enabled;
+    if (Array.isArray(patch.lineNotify.userIds)) {
+      c.lineNotify.userIds = [
+        ...new Set<string>(
+          patch.lineNotify.userIds
+            .filter((v: unknown): v is string => typeof v === 'string')
+            .map((v: string) => v.trim())
+            .filter((v: string) => isLineUserId(v))
+        ),
+      ].slice(0, 5);
+    }
+  }
+
+  if (typeof patch.sheetWebhookUrl === 'string') {
+    const u = patch.sheetWebhookUrl.trim();
+    if (u === '' || isSafeWebhookUrl(u)) c.sheetWebhookUrl = u;
+  }
+
   const lt = num(patch.leadScoreThreshold, 0, 100);
   if (lt !== undefined) c.leadScoreThreshold = lt;
 

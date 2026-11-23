@@ -190,6 +190,28 @@ async function sendLine(e: Entry, text: string) {
   }
 }
 
+/**
+ * 運営者自身のLINE（複数可）へ通知を送る（Messaging API の multicast）。
+ * ※ プッシュ/マルチキャストは、公式アカウントの月間メッセージ通数にカウントされます。
+ *
+ * @param userIds 送信先のLINEユーザーID（「U」から始まる33文字）
+ * @param text    通知本文
+ * @throws LINE_CHANNEL_ACCESS_TOKEN 未設定時、またはLINE APIがエラーを返したとき
+ *
+ * @example
+ * await pushLineToOwners(['Uxxxxxxxx...'], '🔥 見込み客が来ました');
+ */
+export async function pushLineToOwners(userIds: string[], text: string): Promise<void> {
+  if (!userIds.length) return;
+  const token = env('LINE_CHANNEL_ACCESS_TOKEN');
+  if (!token) throw new Error('LINE_CHANNEL_ACCESS_TOKEN が未設定です');
+  await httpJson('https://api.line.me/v2/bot/message/multicast', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ to: userIds, messages: [{ type: 'text', text: clipChars(text, 4500) }] }),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // YouTube (コメントへの返信。受信はポーリング: youtube.ts)
 // ---------------------------------------------------------------------------

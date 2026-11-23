@@ -132,6 +132,8 @@ export default function AutoReply({ persona, bossProfile }: Props) {
   const [draft, setDraft] = useState<any>(null);
   const [originsText, setOriginsText] = useState('');
   const [keywordsText, setKeywordsText] = useState('');
+  const [lineIdsText, setLineIdsText] = useState('');
+  const [notifyTest, setNotifyTest] = useState<Record<string, { ok: boolean; message: string }> | null>(null);
   const [dirty, setDirty] = useState(false);
   const [error, setError] = useState('');
   const [needsAuth, setNeedsAuth] = useState(false);
@@ -163,6 +165,7 @@ export default function AutoReply({ persona, bossProfile }: Props) {
       setDraft(JSON.parse(JSON.stringify(s.config)));
       setOriginsText((s.config.web.allowedOrigins || []).join('\n'));
       setKeywordsText((s.config.handoffKeywords || []).join(', '));
+      setLineIdsText((s.config.lineNotify?.userIds || []).join('\n'));
       setDirty(false);
     }
   }, []);
@@ -233,10 +236,29 @@ export default function AutoReply({ persona, bossProfile }: Props) {
         disclosure: draft.disclosure,
         handoffKeywords: keywordsText.split(/[,、\n]/).map((s) => s.trim()).filter(Boolean),
         notifyWebhookUrl: draft.notifyWebhookUrl,
+        lineNotify: {
+          enabled: !!draft.lineNotify?.enabled,
+          userIds: lineIdsText.split(/[\s,、]+/).map((s) => s.trim()).filter(Boolean),
+        },
+        sheetWebhookUrl: draft.sheetWebhookUrl,
         leadScoreThreshold: draft.leadScoreThreshold,
       },
       'save'
     );
+
+  /** 保存済みの LINE通知 / 記録用Webhook にテスト送信する */
+  const testNotify = async () => {
+    setBusy('notify');
+    setNotifyTest(null);
+    try {
+      const d = await api('/api/admin/test-notify', token, { method: 'POST', body: '{}' });
+      setNotifyTest(d.result);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBusy('');
+    }
+  };
 
   const toggleMaster = async () => {
     const next = !server.config.masterEnabled;
@@ -621,8 +643,68 @@ export default function AutoReply({ persona, bossProfile }: Props) {
             <input type="number" min={0} max={100} className={inputCls + ' mt-1'} value={draft.leadScoreThreshold} onChange={(e) => { setDraft({ ...draft, leadScoreThreshold: Number(e.target.value) }); setDirty(true); }} />
           </div>
         </div>
+        {/* LINE通知（運営者自身のLINEへ） */}
+        <div className="rounded-xl border border-slate-800 p-3 space-y-2">
+          <label className="flex items-center gap-2 text-xs text-slate-300">
+            <input
+              type="checkbox"
+              checked={!!draft.lineNotify?.enabled}
+              onChange={(e) => setField(['lineNotify', 'enabled'], e.target.checked)}
+            />
+            見込み客・要人間対応が来たら、自分のLINEに通知する
+          </label>
+          <label className="text-[11px] font-semibold text-slate-400 block">
+            通知先のLINEユーザーID（「U」から始まる33文字。1行に1つ・最大5件。LINE Developers →「チャネル基本設定」→「あなたのユーザーID」）
+          </label>
+          <textarea
+            rows={2}
+            className={inputCls + ' font-mono text-xs'}
+            value={lineIdsText}
+            placeholder="U0123456789abcdef0123456789abcdef"
+            onChange={(e) => {
+              setLineIdsText(e.target.value);
+              setDirty(true);
+            }}
+          />
+          <p className="text-[11px] text-slate-500">
+            通知を受け取るには、その LINE アカウントでこの公式アカウントを友だち追加しておく必要があります。通知は公式アカウントの月間メッセージ通数にカウントされます。
+          </p>
+        </div>
+
+        {/* 記録用Webhook（GAS → スプレッドシート） */}
         <div>
-          <label className="text-[11px] font-semibold text-slate-400">通知先Webhook URL（Slack / Discord / Make / Zapier。https のみ。見込み客・要人間対応が来たときに通知）</label>
+          <label className="text-[11px] font-semibold text-slate-400">記録用Webhook URL（GAS）… 全受信をスプレッドシートに記録。末尾に ?key=合言葉 を付ける（設定方法はリポジトリの gas/Code.gs）</label>
+          <input
+            className={inputCls + ' mt-1 font-mono text-xs'}
+            value={draft.sheetWebhookUrl || ''}
+            placeholder="https://script.google.com/macros/s/…/exec?key=…"
+            onChange={(e) => { setDraft({ ...draft, sheetWebhookUrl: e.target.value }); setDirty(true); }}
+          />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={testNotify}
+            disabled={busy === 'notify' || dirty}
+            className="px-3 py-1.5 rounded-lg text-xs bg-slate-800 hover:bg-slate-700 text-slate-200 disabled:opacity-40 flex items-center gap-1.5"
+          >
+            <Send className="w-3.5 h-3.5" />
+            LINE通知・スプレッドシートにテスト送信
+          </button>
+          {dirty && <span className="text-[11px] text-amber-300">先に設定を保存してください</span>}
+        </div>
+        {notifyTest && (
+          <ul className="text-[11px] space-y-1">
+            {Object.entries(notifyTest).map(([k, v]) => (
+              <li key={k} className={v.ok ? 'text-emerald-300' : 'text-rose-300'}>
+                {v.ok ? '✅' : '⚠️'} {k === 'line' ? 'LINE通知' : 'スプレッドシート'}：{v.message}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <div>
+          <label className="text-[11px] font-semibold text-slate-400">通知先Webhook URL（任意・Slack / Discord。https のみ。見込み客・要人間対応が来たときに通知）</label>
           <input
             className={inputCls + ' mt-1'}
             value={draft.notifyWebhookUrl}
