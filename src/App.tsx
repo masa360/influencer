@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Sparkles,
   UserCheck,
@@ -138,15 +138,46 @@ const THEME_SUGGESTIONS = [
   '「ChatGPTを全社導入したけど誰も使わない」現象の解決法'
 ];
 
+/** DM誘導シミュレーターの1メッセージ（system は画面表示のみで、AIには送らない） */
+interface DmMsg {
+  sender: 'prospect' | 'influencer' | 'system';
+  text: string;
+  /** AIの判定結果（見込み度など）の表示用 */
+  meta?: string;
+}
+
+/**
+ * localStorage から JSON を読む（壊れている・使えない場合は null）。
+ * @example const boss = loadJson<Record<string, string>>('ai_leadgen_boss');
+ */
+function loadJson<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** localStorage に JSON を保存する（プライベートモード等で失敗しても無視） */
+function saveJson(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    /* 保存できない環境では何もしない */
+  }
+}
+
+const BOSS_STORAGE_KEY = 'ai_leadgen_boss';
+const PERSONA_STORAGE_KEY = 'ai_leadgen_persona';
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<'studio' | 'persona' | 'dm_sim' | 'auto' | 'funnel'>('studio');
 
   // 1. ボス（ユーザー自身）＆集客ゴール設定
   const [bossProfile, setBossProfile] = useState(() => {
-    const saved = localStorage.getItem('ai_leadgen_boss');
-    if (saved) {
-      try { return JSON.parse(saved); } catch (e) {}
-    }
+    const saved = loadJson<Record<string, string>>(BOSS_STORAGE_KEY);
+    if (saved && typeof saved === 'object') return saved;
     return {
       bossName: 'あなた（代表・エグゼクティブコンサルタント）',
       bossTitle: 'AI×経営改革ストラテジスト',
@@ -158,16 +189,29 @@ export default function App() {
   });
 
   // 2. AIインフルエンサー・ペルソナ設定
-  const [selectedTemplateId, setSelectedTemplateId] = useState('pr_secretary');
-  const [persona, setPersona] = useState<PersonaTemplate>(PERSONA_TEMPLATES[0]);
+  // 編集内容はブラウザに自動保存し、再読み込みしても消えないようにする
+  const savedPersona = loadJson<PersonaTemplate>(PERSONA_STORAGE_KEY);
+  const initialPersona: PersonaTemplate =
+    savedPersona && typeof savedPersona === 'object' && savedPersona.name
+      ? { ...(PERSONA_TEMPLATES.find((t) => t.id === savedPersona.id) || PERSONA_TEMPLATES[0]), ...savedPersona }
+      : PERSONA_TEMPLATES[0];
+  const [selectedTemplateId, setSelectedTemplateId] = useState(initialPersona.id);
+  const [persona, setPersona] = useState<PersonaTemplate>(initialPersona);
+
+  useEffect(() => {
+    saveJson(PERSONA_STORAGE_KEY, persona);
+  }, [persona]);
+  useEffect(() => {
+    saveJson(BOSS_STORAGE_KEY, bossProfile);
+  }, [bossProfile]);
 
   // AIアバター生成用ステート
-  const [generatedAvatarUrl, setGeneratedAvatarUrl] = useState<string | null>(PERSONA_TEMPLATES[0].defaultAvatarUrl);
+  const [generatedAvatarUrl, setGeneratedAvatarUrl] = useState<string | null>(initialPersona.defaultAvatarUrl);
   const [isGeneratingAvatar, setIsGeneratingAvatar] = useState(false);
   const [avatarError, setAvatarError] = useState('');
 
   // 3. コンテンツ生成用ステート
-  const [themeInput, setThemeInput] = useState(PERSONA_TEMPLATES[0].sampleHook);
+  const [themeInput, setThemeInput] = useState(initialPersona.sampleHook);
   const [selectedStrategy, setSelectedStrategy] = useState(STRATEGY_PATTERNS[0].id);
   const [isGeneratingContent, setIsGeneratingContent] = useState(false);
   const [contentError, setContentError] = useState('');
@@ -200,7 +244,7 @@ export default function App() {
   });
 
   // 4. DM・コメント自動誘導シミュレーター用ステート
-  const [dmHistory, setDmHistory] = useState([
+  const [dmHistory, setDmHistory] = useState<DmMsg[]>([
     {
       sender: 'prospect',
       text: 'いつも投稿見てます！うちの会社もAI導入したいんですが、社員がアナログすぎて何から始めればいいか分からなくて…'
@@ -211,6 +255,7 @@ export default function App() {
     }
   ]);
   const [dmInput, setDmInput] = useState('');
+  const dmListRef = useRef<HTMLDivElement>(null);
   const [isSimulatingDm, setIsSimulatingDm] = useState(false);
 
   // 5. ファネル試算シミュレーター用ステート
@@ -235,7 +280,8 @@ export default function App() {
   };
 
   const handleSaveSettings = () => {
-    localStorage.setItem('ai_leadgen_boss', JSON.stringify(bossProfile));
+    saveJson(BOSS_STORAGE_KEY, bossProfile);
+    saveJson(PERSONA_STORAGE_KEY, persona);
     setSavedSuccess(true);
     setTimeout(() => setSavedSuccess(false), 2500);
   };
@@ -302,23 +348,48 @@ export default function App() {
   // --- DM・コメント誘導シミュレーター応答生成 ---
   const handleSendDm = async (customText: string | null = null) => {
     const messageToSend = customText || dmInput;
-    if (!messageToSend.trim()) return;
+    if (!messageToSend.trim() || isSimulatingDm) return;
 
-    const updatedHistory = [...dmHistory, { sender: 'prospect', text: messageToSend }];
+    const updatedHistory: DmMsg[] = [...dmHistory, { sender: 'prospect', text: messageToSend }];
     setDmHistory(updatedHistory);
     if (!customText) setDmInput('');
     setIsSimulatingDm(true);
 
     try {
-      const data = await postJson('/api/chat-dm', { history: updatedHistory, persona, bossProfile });
-      setDmHistory([...updatedHistory, { sender: 'influencer', text: data.reply || '（返信が空でした）' }]);
+      // 本番のLINE自動返信と同じ判定・プロンプトで返信案を作る（system メッセージはAIに送らない）
+      const data = await postJson('/api/chat-dm', {
+        history: updatedHistory.filter((m) => m.sender !== 'system'),
+        persona,
+        bossProfile,
+      });
+      const meta = [
+        data.leadScore != null ? `見込み度 ${data.leadScore}` : '',
+        data.intent ? `意図: ${data.intent}` : '',
+      ]
+        .filter(Boolean)
+        .join(' ／ ');
+      const next: DmMsg[] = [...updatedHistory];
+      if (data.reply) next.push({ sender: 'influencer', text: data.reply, meta });
+      if (data.status !== 'reply') {
+        next.push({
+          sender: 'system',
+          text: data.status === 'needs_human' ? `🙋 要人間対応：${data.note}` : `⏭ ${data.note || '返信しない判定'}`,
+        });
+      }
+      setDmHistory(next);
     } catch (e: any) {
-      // 失敗時に定型文を「AIの返信」として見せると品質確認を誤るので、エラーと明示する
-      setDmHistory([...updatedHistory, { sender: 'influencer', text: `⚠️ 返信の生成に失敗しました：${e.message}` }]);
+      // 失敗時に定型文を「AIの返信」として見せると品質確認を誤るので、エラーと明示する（AIには送らない）
+      setDmHistory([...updatedHistory, { sender: 'system', text: `⚠️ 返信の生成に失敗しました：${e.message}` }]);
     } finally {
       setIsSimulatingDm(false);
     }
   };
+
+  // 新しいメッセージが来たら、チャット欄を一番下までスクロールする
+  useEffect(() => {
+    const el = dmListRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [dmHistory, isSimulatingDm, activeTab]);
 
   // 全コンテンツのMarkdownダウンロード
   const handleDownloadMarkdown = () => {
@@ -1119,7 +1190,7 @@ ${generatedPack.imagePromptJa}
                 <UserCheck className="w-5 h-5 text-blue-400" />
                 <div>
                   <h3 className="text-base font-bold text-white">2. AIインフルエンサーの人格・関係性カスタマイズ</h3>
-                  <p className="text-xs text-slate-400">自分で自分を褒めると嫌味になりますが、AI秘書や弟子が褒めると「信頼」に変わります</p>
+                  <p className="text-xs text-slate-400">公式AI広報がボスを紹介すると、自慢っぽくならずに伝わります（公式キャラであることは明示します）</p>
                 </div>
               </div>
 
@@ -1202,6 +1273,9 @@ ${generatedPack.imagePromptJa}
               <p className="text-xs text-slate-400 leading-relaxed">
                 SNSの投稿を見たフォロワー（見込み客）からコメントやDMが来た際、<strong>{persona.name}</strong>がどのように会話を温め、売り込み感ゼロで<strong>あなた（ボス）の個別相談へパスを出すか</strong>をテストできます。
               </p>
+              <p className="text-[11px] text-emerald-300/90 leading-relaxed">
+                ✅ 本番のLINE自動返信と同じ判定・同じ指示で返信を作ります（人間対応キーワードやAI明示の文言も反映）。ここで確認した品質が、そのまま本番の品質です。
+              </p>
 
               <div className="space-y-2 pt-2">
                 <span className="text-xs font-semibold text-slate-300 block">
@@ -1252,8 +1326,14 @@ ${generatedPack.imagePromptJa}
               </div>
 
               {/* チャット履歴 */}
-              <div className="flex-1 overflow-y-auto space-y-4 pr-2">
-                {dmHistory.map((msg, i) => (
+              <div ref={dmListRef} className="flex-1 overflow-y-auto space-y-4 pr-2">
+                {dmHistory.map((msg, i) => msg.sender === 'system' ? (
+                  <div key={i} className="flex justify-center">
+                    <div className="max-w-[90%] rounded-xl px-3 py-2 text-[11px] text-slate-300 bg-slate-800/60 border border-slate-700 whitespace-pre-wrap">
+                      {msg.text}
+                    </div>
+                  </div>
+                ) : (
                   <div
                     key={i}
                     className={`flex ${msg.sender === 'prospect' ? 'justify-end' : 'justify-start'}`}
@@ -1275,6 +1355,7 @@ ${generatedPack.imagePromptJa}
                         )}
                       </div>
                       {msg.text}
+                      {msg.meta && <div className="mt-2 text-[10px] text-amber-300/80">{msg.meta}</div>}
                     </div>
                   </div>
                 ))}
@@ -1294,7 +1375,12 @@ ${generatedPack.imagePromptJa}
                   type="text"
                   value={dmInput}
                   onChange={(e) => setDmInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && handleSendDm()}
+                  onKeyDown={(e) => {
+                    // 日本語入力の変換確定（Enter）では送信しない
+                    if (e.key !== 'Enter' || e.nativeEvent.isComposing || e.keyCode === 229) return;
+                    e.preventDefault();
+                    handleSendDm();
+                  }}
                   placeholder="見込み客として質問や悩みを入力してみてください..."
                   className="flex-1 rounded-xl bg-slate-950 border border-slate-800 px-3.5 py-2.5 text-sm text-white focus:border-amber-500 focus:outline-none"
                 />

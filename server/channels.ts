@@ -1,6 +1,6 @@
 import type { ChannelId, Entry, Kind, Source } from './store.ts';
 import { getConfig } from './store.ts';
-import { clipBytes, clipChars, httpJson, verifyHmac } from './util.ts';
+import { clipBytes, clipChars, envValue, httpJson, verifyHmac } from './util.ts';
 import { getGoogleAccessToken } from './tokens.ts';
 
 /** 各チャンネルのWebhook/ポーリングから生成される「受信メッセージ」 */
@@ -18,7 +18,8 @@ export interface Inbound {
   viaApi?: boolean;
 }
 
-const env = (k: string) => process.env[k];
+/** 環境変数（空・仮の値は未設定扱い） */
+const env = (k: string) => envValue(k);
 
 // ---------------------------------------------------------------------------
 // 認証情報の有無（値そのものはUIに出さない）
@@ -153,6 +154,8 @@ export function parseLine(body: any): Inbound[] {
   const out: Inbound[] = [];
   for (const ev of body?.events || []) {
     if (ev?.type !== 'message' || ev.message?.type !== 'text') continue;
+    // 1対1のトークのみ対象（グループ・複数人トークで全発言に反応しないように）
+    if (ev.source?.type !== 'user') continue;
     const userId = ev.source?.userId;
     if (!userId) continue;
     out.push({

@@ -180,27 +180,45 @@ function load(): DB {
 
 let timer: NodeJS.Timeout | null = null;
 
-function saveNow() {
-  if (!db) return;
+/**
+ * 保存の間隔。Cloud Storage（Cloud Run の永続ボリューム）は「同じファイルへの書き込みは1秒に1回まで」
+ * という制限があるため、変更をまとめて1秒ごとに書き出す。終了時（SIGTERM）は flush() で即保存する。
+ */
+const SAVE_DEBOUNCE_MS = 1000;
+/** 保存に失敗したときの再試行間隔（最大30秒まで延ばす） */
+let retryDelay = 2000;
+
+/** 今すぐ保存する。成功なら true */
+function saveNow(): boolean {
+  if (!db) return true;
   try {
     fs.mkdirSync(dataDir(), { recursive: true });
     const tmp = dbFile() + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(db), { mode: 0o600 });
     fs.renameSync(tmp, dbFile());
+    retryDelay = 2000;
+    return true;
   } catch (e) {
     console.error('[store] save failed:', (e as Error).message);
+    return false;
   }
 }
 
-function scheduleSave() {
+function scheduleSave(delay = SAVE_DEBOUNCE_MS) {
   if (timer) return;
   timer = setTimeout(() => {
     timer = null;
-    saveNow();
-  }, 150);
+    if (!saveNow()) {
+      // 一時的な失敗（ストレージの混雑など）でデータを失わないよう、間隔を空けて再試行する
+      const next = retryDelay;
+      retryDelay = Math.min(retryDelay * 2, 30_000);
+      scheduleSave(next);
+    }
+  }, delay);
   timer.unref?.();
 }
 
+/** 保存待ちの変更を今すぐ書き出す（終了時に呼ぶ） */
 export function flush() {
   if (timer) {
     clearTimeout(timer);
@@ -227,6 +245,16 @@ export function getConfig(): Config {
 const str = (v: unknown, max: number): string | undefined => (typeof v === 'string' ? v.trim().slice(0, max) : undefined);
 const num = (v: unknown, min: number, max: number): number | undefined =>
   typeof v === 'number' && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.round(v))) : undefined;
+
+/**
+ * AIキャラ／ボス設定を、許可したキーの文字列だけに整える（長さ上限1500文字）。
+ *
+ * @example
+ * sanitizeProfile({ name: 'レイ', evil: 1 }, PERSONA_KEYS); // { name: 'レイ' }
+ */
+export function sanitizeProfile(obj: any, keys: readonly string[]): Record<string, string> | null {
+  return pick(obj, keys);
+}
 
 function pick(obj: any, keys: readonly string[]): Record<string, string> | null {
   if (!obj || typeof obj !== 'object') return null;

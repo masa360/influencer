@@ -18,4 +18,5 @@ ENV PORT=8080
 ENV DATA_DIR=/data
 
 EXPOSE 8080
-CMD ["npx", "tsx", "server.ts"]
+# npx を挟まず node で直接起動する（Cloud Run の停止信号 SIGTERM を確実に受け取り、データを保存してから終了するため）
+CMD ["node", "--import", "tsx", "server.ts"]

@@ -294,9 +294,11 @@ test('Meta: 検証チャレンジ・署名・エコー無視・コメント返�
 test('LINE: 署名検証とテキストメッセージ処理', async () => {
   setup({ line: 'auto' });
   const body = { events: [
-    { type: 'message', webhookEventId: 'w1', replyToken: 'tok', timestamp: Date.now(), source: { userId: 'U9' }, message: { type: 'text', id: '1', text: 'こんにちは' } },
-    { type: 'message', webhookEventId: 'w2', replyToken: 'tok2', source: { userId: 'U9' }, message: { type: 'image', id: '2' } },
-    { type: 'follow', replyToken: 't3', source: { userId: 'U9' } },
+    { type: 'message', webhookEventId: 'w1', replyToken: 'tok', timestamp: Date.now(), source: { type: 'user', userId: 'U9' }, message: { type: 'text', id: '1', text: 'こんにちは' } },
+    { type: 'message', webhookEventId: 'w2', replyToken: 'tok2', source: { type: 'user', userId: 'U9' }, message: { type: 'image', id: '2' } },
+    { type: 'follow', replyToken: 't3', source: { type: 'user', userId: 'U9' } },
+    // グループ内の発言には反応しない
+    { type: 'message', webhookEventId: 'w4', replyToken: 'tok4', timestamp: Date.now(), source: { type: 'group', groupId: 'G1', userId: 'U8' }, message: { type: 'text', id: '4', text: 'みなさんこんにちは' } },
   ] };
   const raw = JSON.stringify(body);
   assert.equal(((await h.lineWebhookPost(req({ body, rawBody: raw, headers: { 'x-line-signature': 'nope' } }))) as any).status, 401);
@@ -607,4 +609,103 @@ test('テスト送信API: 未設定なら理由を返し、設定済みなら送
 
   // 管理トークンなしは401
   assert.equal(((await h.adminTestNotify(req({}))) as any).status, 401);
+});
+
+// ============================================================ 見直し（完成度向上）
+
+test('プレビュー: 人間対応キーワードはGeminiを呼ばずに needs_human', async () => {
+  setup({ line: 'auto' });
+  const r = await pipeline.previewReply({ channel: 'line', kind: 'dm', message: '解約したいです', history: [], config: store.getConfig() });
+  assert.equal(r.status, 'needs_human');
+  assert.equal(genCalls, 0);
+  assert.match(r.note, /解約/);
+});
+
+test('プレビュー: 初回は本番と同じAI明示文が付き、2回目以降は付かない', async () => {
+  setup({ line: 'auto' });
+  const cfg = store.getConfig();
+  const first = await pipeline.previewReply({ channel: 'line', kind: 'dm', message: '相談したい', history: [], config: cfg });
+  assert.equal(first.status, 'reply');
+  assert.ok(first.reply.includes('運営者公式のAIアシスタント'));
+  const second = await pipeline.previewReply({
+    channel: 'line', kind: 'dm', message: '詳しく', config: cfg,
+    history: [{ sender: 'prospect', text: '相談したい' }, { sender: 'influencer', text: 'ありがとうございます' }],
+  });
+  assert.ok(!second.reply.includes('運営者公式のAIアシスタント'));
+  // プレビューは保存・送信しない
+  assert.equal(store.listEntries().length, 0);
+  assert.equal(calls.length, 0);
+});
+
+test('プレビュー: スパム判定は skipped、AIの人間対応推奨は needs_human', async () => {
+  setup({ line: 'auto' });
+  genImpl = () => ({ reply: '', intent: 'spam', needsHuman: false, leadScore: 0, shouldReply: false });
+  const a = await pipeline.previewReply({ channel: 'line', kind: 'dm', message: '副業で稼げます', history: [], config: store.getConfig() });
+  assert.equal(a.status, 'skipped');
+  genImpl = () => ({ reply: '担当者からご連絡します', intent: 'complaint', needsHuman: true, leadScore: 5, shouldReply: true });
+  const b = await pipeline.previewReply({ channel: 'line', kind: 'dm', message: '対応がひどい', history: [], config: store.getConfig() });
+  assert.equal(b.status, 'needs_human');
+  assert.ok(b.reply.startsWith('担当者からご連絡します'));
+});
+
+test('管理画面の返信プレビューも本番と同じ判定（キーワードで要人間対応）', async () => {
+  setup({ line: 'auto' });
+  const r = (await h.adminTestReply(req({ headers: { authorization: 'Bearer admin-secret' }, body: { channel: 'line', message: '返金をお願いします' } }))) as any;
+  assert.equal(r.status, 200);
+  assert.equal(r.body.result.needsHuman, true);
+  assert.equal(genCalls, 0);
+});
+
+test('返信エラーは運営者のLINEに通知（30分に1回まで）', async () => {
+  setup({ line: 'auto' });
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER] } });
+  genImpl = () => {
+    throw new Error('quota exceeded');
+  };
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'er1', senderId: 'U1', text: 'こんにちは', ref: {} });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'er2', senderId: 'U2', text: 'こんにちは', ref: {} });
+  await sleep(20);
+  const m = calls.filter((c) => c.url.endsWith('/multicast'));
+  assert.equal(m.length, 1, '連続したエラーは1回だけ通知');
+  assert.match(m[0].body.messages[0].text, /返信エラー/);
+  assert.match(m[0].body.messages[0].text, /quota exceeded/);
+});
+
+test('環境変数: 空や仮の値（MY_xxx・ここに…）は未設定として扱う', async () => {
+  const keep = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'MY_GEMINI_API_KEY';
+  assert.equal(util.envValue('GEMINI_API_KEY'), '');
+  process.env.GEMINI_API_KEY = 'ここにGeminiのAPIキー';
+  assert.equal(util.envValue('GEMINI_API_KEY'), '');
+  process.env.GEMINI_API_KEY = '  real-key  ';
+  assert.equal(util.envValue('GEMINI_API_KEY'), 'real-key');
+  process.env.GEMINI_API_KEY = 'MY_GEMINI_API_KEY';
+  const ch = await import('../server/channels.ts');
+  assert.equal(ch.credentialStatus().gemini.configured, false);
+  if (keep === undefined) delete process.env.GEMINI_API_KEY;
+  else process.env.GEMINI_API_KEY = keep;
+});
+
+test('起動チェック: 永続ボリュームの判定と、設定一覧の表示', async () => {
+  const st = await import('../server/startup.ts');
+  const mounts = [
+    '22 1 0:21 / / rw - overlay overlay rw',
+    '30 22 0:30 / /data rw - fuse gcsfuse rw',
+    '31 22 0:31 / /etc/hosts rw - ext4 /dev/sda rw',
+  ].join('\n');
+  assert.equal(st.isEphemeralDir('/data', mounts), false, 'マウントされたディレクトリ');
+  assert.equal(st.isEphemeralDir('/data/sub', mounts), false, 'マウント配下');
+  assert.equal(st.isEphemeralDir('/app/data', mounts), true, 'コンテナ内の使い捨て領域');
+
+  const lines = st.setupChecklist();
+  assert.ok(lines.some((l) => l.includes('ADMIN_TOKEN')));
+  assert.ok(lines.some((l) => l.includes('LINE: 設定済み')));
+  assert.ok(lines.every((l) => l.startsWith('[setup] ')));
+});
+
+test('保存: 変更は flush() で即座にファイルへ書き出される（終了時の保存）', () => {
+  store.updateConfig({ leadScoreThreshold: 55 });
+  store.flush();
+  const saved = JSON.parse(fs.readFileSync(path.join(process.env.DATA_DIR!, 'db.json'), 'utf8'));
+  assert.equal(saved.config.leadScoreThreshold, 55);
 });

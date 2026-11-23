@@ -21,11 +21,10 @@ import {
   verifyMeta,
   type Inbound,
 } from './channels.ts';
-import { approveEntry, buildNotifyText, entryPayload, HttpError, processInbound, rejectEntry } from './pipeline.ts';
-import { generateReply } from './agent.ts';
+import { approveEntry, buildNotifyText, entryPayload, HttpError, previewReply, processInbound, rejectEntry } from './pipeline.ts';
 import { pollYouTubeOnce } from './youtube.ts';
 import { WIDGET_JS } from './widget.ts';
-import { cleanInput, httpJson, safeEqual, tryConsume } from './util.ts';
+import { cleanInput, envValue, httpJson, safeEqual, tryConsume } from './util.ts';
 
 export interface Req {
   method: string;
@@ -77,7 +76,7 @@ function background(items: Inbound[]) {
 // ---------------------------------------------------------------------------
 
 export const metaWebhookGet: Handler = (req) => {
-  const verify = process.env.META_VERIFY_TOKEN;
+  const verify = envValue('META_VERIFY_TOKEN');
   if (verify && q(req.query['hub.mode']) === 'subscribe' && safeEqual(q(req.query['hub.verify_token']), verify)) {
     return { status: 200, text: q(req.query['hub.challenge']), contentType: 'text/plain' };
   }
@@ -242,7 +241,7 @@ function isLoopback(addr: string) {
 
 /** 認証OKなら null、NGならエラーレスポンス */
 export function adminGuard(req: Req): Res | null {
-  const token = process.env.ADMIN_TOKEN;
+  const token = envValue('ADMIN_TOKEN');
   if (token) {
     const given = bearer(req);
     return given && safeEqual(given, token) ? null : err(401, 'unauthorized');
@@ -273,7 +272,7 @@ function state(req: Req) {
     },
     apiKey: getApiKey(),
     stats: stats(),
-    adminProtected: !!process.env.ADMIN_TOKEN,
+    adminProtected: !!envValue('ADMIN_TOKEN'),
   };
 }
 
@@ -316,8 +315,11 @@ export const adminTestReply: Handler = guarded(async (req) => {
   if (!message) return err(400, 'message_required');
   const kind: Kind = req.body?.kind === 'comment' ? 'comment' : channel === 'web' ? 'web' : 'dm';
   try {
-    const r = await generateReply({ channel, kind, message, history: [], isFirstReply: true, config: getConfig() });
-    return ok({ result: r });
+    // 本番と同じ判定（人間対応キーワード・AI明示の付与）で返信案を作る
+    const r = await previewReply({ channel, kind, message, history: [], config: getConfig() });
+    return ok({
+      result: { ...r, needsHuman: r.status === 'needs_human', shouldReply: r.status !== 'skipped' },
+    });
   } catch (e) {
     return err(502, (e as Error).message);
   }

@@ -1,5 +1,5 @@
 import type { ChannelId, Kind, Msg, Config } from './store.ts';
-import { clipChars } from './util.ts';
+import { clipChars, envValue } from './util.ts';
 
 export type Intent = 'lead' | 'question' | 'praise' | 'complaint' | 'spam' | 'other';
 
@@ -98,7 +98,7 @@ ${safeMsg}
 let client: any = null;
 
 async function defaultGenerator({ system, prompt }: { system: string; prompt: string }): Promise<unknown> {
-  const key = process.env.GEMINI_API_KEY;
+  const key = envValue('GEMINI_API_KEY');
   if (!key) throw new Error('GEMINI_API_KEY が未設定です');
   const { GoogleGenAI, Type } = await import('@google/genai');
   client ||= new GoogleGenAI({ apiKey: key, httpOptions: { headers: { 'User-Agent': 'aistudio-build' } } });

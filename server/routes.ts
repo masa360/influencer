@@ -1,8 +1,9 @@
 import type { Express, NextFunction, Request, Response } from 'express';
 import * as h from './handlers.ts';
+import { envValue } from './util.ts';
 
 function baseUrlOf(req: Request): string {
-  if (process.env.APP_URL && !/^MY_APP_URL$/.test(process.env.APP_URL)) return process.env.APP_URL;
+  if (envValue('APP_URL')) return envValue('APP_URL');
   const proto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0] || req.protocol;
   const host = (req.headers['x-forwarded-host'] as string)?.split(',')[0] || req.headers.host || 'localhost';
   return `${proto}://${host}`;

@@ -1,6 +1,6 @@
 import type { Inbound } from './channels.ts';
 import { pushLineToOwners, sendReply } from './channels.ts';
-import { generateReply } from './agent.ts';
+import { generateReply, type Intent } from './agent.ts';
 import {
   addHistory,
   getConfig,
@@ -10,9 +10,65 @@ import {
   markSeen,
   newId,
   saveEntry,
+  type ChannelId,
+  type Config,
   type Entry,
+  type Kind,
+  type Msg,
 } from './store.ts';
-import { cleanInput, httpJson, tryConsume } from './util.ts';
+import { cleanInput, envValue, httpJson, tryConsume } from './util.ts';
+
+/** 人間対応キーワードに一致したものを返す（なければ undefined） */
+export function findHandoffKeyword(cfg: Config, text: string): string | undefined {
+  const lower = text.toLowerCase();
+  return cfg.handoffKeywords.find((k) => k && lower.includes(k.toLowerCase()));
+}
+
+/** 設定に応じて「AIによる自動返信です」の明示文を付ける（コメント返信と初回メッセージのみ） */
+export function withDisclosure(cfg: Config, kind: Kind, isFirstReply: boolean, reply: string): string {
+  if (cfg.disclosure.enabled && cfg.disclosure.text && (kind === 'comment' || isFirstReply)) {
+    return `${reply}\n${cfg.disclosure.text}`;
+  }
+  return reply;
+}
+
+export interface PreviewResult {
+  /** reply: 返信する / needs_human: 人間に回す / skipped: 返信しない（スパム等） */
+  status: 'reply' | 'needs_human' | 'skipped';
+  reply: string;
+  intent: Intent | null;
+  leadScore: number | null;
+  note: string;
+}
+
+/**
+ * 本番と同じ判定・プロンプトで返信案を作る（保存・送信・通知はしない）。
+ * DM誘導シミュレーターや管理画面の「返信プレビュー」で使う。
+ *
+ * @example
+ * const r = await previewReply({ channel: 'line', kind: 'dm', message: '相談したい', history: [], config: getConfig() });
+ * // r.status === 'reply' なら r.reply が実際に送られる文面
+ */
+export async function previewReply(args: {
+  channel: ChannelId;
+  kind: Kind;
+  message: string;
+  history: Msg[];
+  config: Config;
+}): Promise<PreviewResult> {
+  const { config: cfg, kind } = args;
+  const text = cleanInput(args.message);
+  const hit = findHandoffKeyword(cfg, text);
+  if (hit) {
+    return { status: 'needs_human', reply: '', intent: null, leadScore: null, note: `人間対応キーワード「${hit}」を含むため、AIは返信せずあなたに回します` };
+  }
+  const isFirstReply = !args.history.some((m) => m.sender === 'influencer');
+  const r = await generateReply({ channel: args.channel, kind, message: text, history: args.history, isFirstReply, config: cfg });
+  if (!r.shouldReply) return { status: 'skipped', reply: '', intent: r.intent, leadScore: r.leadScore, note: `返信不要と判断（${r.intent}）` };
+  const reply = withDisclosure(cfg, kind, isFirstReply, r.reply);
+  if (r.needsHuman) return { status: 'needs_human', reply, intent: r.intent, leadScore: r.leadScore, note: 'AIが人間対応を推奨（本番では自動送信せず、あなたに通知します）' };
+  return { status: 'reply', reply, intent: r.intent, leadScore: r.leadScore, note: '' };
+}
 
 /**
  * すべての受信（SNS/YouTube/LP/HP/API）が通る共通処理。
@@ -61,8 +117,7 @@ export async function processInbound(inb: Inbound): Promise<Entry> {
   };
 
   // 人間対応キーワード（モデルを呼ぶ前に判定）
-  const lower = text.toLowerCase();
-  const hit = cfg.handoffKeywords.find((k) => k && lower.includes(k.toLowerCase()));
+  const hit = findHandoffKeyword(cfg, text);
   if (hit) return finish({ status: 'needs_human', note: `人間対応キーワード: ${hit}` });
 
   // 送信者ごと/全体のレート制限（広告費ならぬAPI費の暴走防止）
@@ -100,10 +155,7 @@ export async function processInbound(inb: Inbound): Promise<Entry> {
 
   if (!result.shouldReply) return finish({ status: 'skipped', note: `返信不要 (${result.intent})` });
 
-  let reply = result.reply;
-  if (cfg.disclosure.enabled && cfg.disclosure.text && (inb.kind === 'comment' || isFirstReply)) {
-    reply = `${reply}\n${cfg.disclosure.text}`;
-  }
+  const reply = withDisclosure(cfg, inb.kind, isFirstReply, result.reply);
   entry.reply = reply;
 
   if (result.needsHuman) return finish({ status: 'needs_human', note: 'AIが人間対応を推奨' });
@@ -166,17 +218,31 @@ export class HttpError extends Error {
   }
 }
 
-/** 通知の対象か（見込み度が閾値以上、または要人間対応） */
+/** エラー通知の間隔（同じ障害で通知が連続しないように） */
+const ERROR_NOTIFY_WINDOW_MS = 30 * 60_000;
+
+/**
+ * 通知の対象か。
+ * - 要人間対応
+ * - 見込み度が閾値以上
+ * - 返信エラー（Gemini障害・送信失敗など。見込み客が放置されるため。30分に1回まで）
+ */
 function shouldNotify(e: Entry): boolean {
   const cfg = getConfig();
   if (e.status === 'needs_human') return true;
-  return (e.leadScore ?? 0) >= cfg.leadScoreThreshold && e.status !== 'skipped' && e.status !== 'error';
+  if (e.status === 'error') return tryConsume([{ key: 'notify-error', max: 1 }], ERROR_NOTIFY_WINDOW_MS);
+  return (e.leadScore ?? 0) >= cfg.leadScoreThreshold && e.status !== 'skipped';
 }
 
 /** 通知本文（LINE・Slack・Discord 共通） */
 export function buildNotifyText(e: Entry): string {
-  const label = e.status === 'needs_human' ? '🙋 要人間対応' : `🔥 見込み客（スコア${e.leadScore}）`;
-  const appUrl = process.env.APP_URL && !/^MY_APP_URL$/.test(process.env.APP_URL) ? process.env.APP_URL.replace(/\/$/, '') : '';
+  const label =
+    e.status === 'error'
+      ? `⚠️ 返信エラー（見込み客に返信できていません）\n理由：${(e.note || '不明').slice(0, 150)}\n※ 同様のエラーは30分間通知しません`
+      : e.status === 'needs_human'
+        ? '🙋 要人間対応'
+        : `🔥 見込み客（スコア${e.leadScore}）`;
+  const appUrl = envValue('APP_URL').replace(/\/$/, '');
   return [
     `${label}`,
     `[${e.channel}] ${e.senderName || e.senderId}`,

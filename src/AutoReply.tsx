@@ -382,8 +382,9 @@ export default function AutoReply({ persona, bossProfile }: Props) {
         {error && <p className="text-xs text-rose-300">{error}</p>}
         <button
           onClick={() => {
-            sessionStorage.setItem(TOKEN_KEY, tokenInput);
-            setToken(tokenInput);
+            const t = tokenInput.trim(); // コピー時に紛れ込む前後の空白・改行を除く
+            sessionStorage.setItem(TOKEN_KEY, t);
+            setToken(t);
           }}
           className="w-full rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-semibold py-2 text-sm"
         >
@@ -763,12 +764,13 @@ export default function AutoReply({ persona, bossProfile }: Props) {
         {testOut && (
           <div className="rounded-xl border border-slate-800 bg-slate-950 p-3 space-y-2">
             <div className="flex flex-wrap gap-2 text-[11px]">
-              <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">意図: {testOut.intent}</span>
-              <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">リードスコア: {testOut.leadScore}</span>
+              {testOut.intent && <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">意図: {testOut.intent}</span>}
+              {testOut.leadScore != null && <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">リードスコア: {testOut.leadScore}</span>}
               {testOut.needsHuman && <span className="px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300">要人間対応</span>}
               {!testOut.shouldReply && <span className="px-2 py-0.5 rounded-full bg-slate-700 text-slate-300">返信しない判定</span>}
             </div>
             <p className="text-sm text-slate-200 whitespace-pre-wrap">{testOut.reply || '（返信なし）'}</p>
+            {testOut.note && <p className="text-[11px] text-slate-400">{testOut.note}</p>}
           </div>
         )}
       </Card>

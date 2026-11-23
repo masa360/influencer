@@ -5,16 +5,26 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import { registerRoutes, requireAdmin } from './server/routes.ts';
 import { startYouTubePoller } from './server/youtube.ts';
+import { previewReply } from './server/pipeline.ts';
+import { BOSS_KEYS, flush, getConfig, PERSONA_KEYS, sanitizeProfile, type Msg } from './server/store.ts';
+import { envValue } from './server/util.ts';
+import { setupChecklist } from './server/startup.ts';
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+app.disable('x-powered-by');
+
+// 動作確認用（「動いているか」の確認に使う）。※ Cloud Run は末尾が z のパス（/healthz 等）を予約しているので /health にする
+app.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
 
 // Webhookの署名検証には「生のボディ」が必要なので、JSONパース時に保持する
 app.use(
   express.json({
-    limit: '10mb',
+    limit: '1mb',
     verify: (req, _res, buf) => {
       (req as any).rawBody = buf.toString('utf8');
     },
@@ -23,15 +33,15 @@ app.use(
 // Cloud Run / リバースプロキシ配下でクライアントIPを正しく取得（レート制限用）
 app.set('trust proxy', 1);
 
-// Shared Gemini client with telemetry header
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Gemini クライアント（キーが設定されているときだけ作る。未設定時の英語警告を出さないため）
+let aiClient: GoogleGenAI | null = null;
+function ai(): GoogleGenAI {
+  aiClient ||= new GoogleGenAI({
+    apiKey: envValue('GEMINI_API_KEY'),
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
+  return aiClient;
+}
 
 // 使用モデル（環境変数で変更可能）
 const TEXT_MODEL = () => process.env.GEMINI_MODEL || 'gemini-3.8-flash';
@@ -84,9 +94,9 @@ ${strategyTitle || '課題提起 ➔ ボスへの解決策誘導'} (${strategyDe
 各プラットフォームの特性に合わせ、読者が思わず引き込まれ、「そのボス（先生/代表）に相談したい！」と強く感じるストーリーにしてください。`;
 
   try {
-    if (!process.env.GEMINI_API_KEY) return noKey(res);
+    if (!envValue('GEMINI_API_KEY')) return noKey(res);
 
-    const response = await ai.models.generateContent({
+    const response = await ai().models.generateContent({
       model: TEXT_MODEL(),
       contents: userPrompt,
       config: {
@@ -146,41 +156,37 @@ ${strategyTitle || '課題提起 ➔ ボスへの解決策誘導'} (${strategyDe
   }
 });
 
-// 2. DM Simulation Endpoint
+// 2. DM誘導シミュレーター
+//    本番の自動返信と「同じ判定・同じプロンプト」で返信案を作る（保存・送信・通知はしない）。
+//    ここで確認した品質が、そのまま本番のLINE返信の品質になる。
 app.post('/api/chat-dm', requireAdmin, async (req: Request, res: Response) => {
-  const { history, persona, bossProfile } = req.body;
-
-  if (!history || !Array.isArray(history) || !persona || !bossProfile) {
+  const { history, persona, bossProfile } = req.body || {};
+  if (!Array.isArray(history) || !history.length || !persona || !bossProfile) {
     return res.status(400).json({ error: 'Missing parameters' });
   }
+  const last = history[history.length - 1];
+  if (last?.sender !== 'prospect' || typeof last.text !== 'string' || !last.text.trim()) {
+    return res.status(400).json({ error: '最後のメッセージは見込み客の発言にしてください' });
+  }
+  if (!envValue('GEMINI_API_KEY')) return noKey(res);
 
-  const systemInstruction = `あなたは「${persona.name}（${persona.role}）」として、SNSのフォロワー（見込み客）からのコメントやDMに返信するAIエージェントです。
-口調: ${persona.tone}
-あなたはボスが運営する公式のAIアシスタントです。第三者や一般ユーザーのふりはせず、関係を聞かれたら正直に答えてください。
-ボス情報にない実績・数字・料金は作らないでください。
-あなたの目的は、売り込み感を一切出さずに相手に共感・ヒアリングしつつ、自然な流れであなたのボスである「${bossProfile.bossTitle}（${bossProfile.bossStrength}）」への個別相談（${bossProfile.ctaGoal} / ${bossProfile.ctaLinkText}）を案内することです。
-長すぎず、LINEやDMで読みやすい3〜5行程度の自然な日本語で返信してください。`;
+  const p = sanitizeProfile(persona, PERSONA_KEYS);
+  const b = sanitizeProfile(bossProfile, BOSS_KEYS);
+  if (!p?.name) return res.status(400).json({ error: 'AIキャラの名前を入力してください' });
 
-  const conversationContext = history
-    .map((m: any) => `${m.sender === 'prospect' ? '見込み客' : persona.name}: ${m.text}`)
-    .join('\n');
-
-  const userPrompt = `以下のやり取りの続きとして、${persona.name}からの最適な返信メッセージを作成してください。\n\n${conversationContext}`;
+  // 画面上のキャラ・ボス設定で上書きした設定（サーバー保存はしない）
+  const config = { ...getConfig(), persona: p, bossProfile: b };
+  const prior: Msg[] = history
+    .slice(0, -1)
+    .slice(-20)
+    .filter((m: any) => (m?.sender === 'prospect' || m?.sender === 'influencer') && typeof m.text === 'string')
+    .map((m: any) => ({ sender: m.sender, text: m.text.slice(0, 1500) }));
 
   try {
-    if (!process.env.GEMINI_API_KEY) return noKey(res);
-
-    const response = await ai.models.generateContent({
-      model: TEXT_MODEL(),
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-      },
-    });
-
-    return res.json({ reply: response.text || '' });
+    const r = await previewReply({ channel: 'line', kind: 'dm', message: last.text, history: prior, config });
+    return res.json(r);
   } catch (error: any) {
-    console.error('DM chat error:', error);
+    console.error('DM chat error:', error?.message || error);
     return res.status(502).json({ error: '返信の生成に失敗しました。時間をおいて再試行してください。' });
   }
 });
@@ -195,9 +201,9 @@ app.post('/api/generate-avatar', requireAdmin, async (req: Request, res: Respons
   const promptText = `High-end commercial portrait photography of an AI social media influencer: ${persona.visualStyle}. Looking at camera, engaging expression, ultra-detailed, professional corporate lighting, 1:1 aspect ratio.`;
 
   try {
-    if (!process.env.GEMINI_API_KEY) return noKey(res);
+    if (!envValue('GEMINI_API_KEY')) return noKey(res);
 
-    const response = await ai.models.generateContent({
+    const response = await ai().models.generateContent({
       model: IMAGE_MODEL(),
       contents: {
         parts: [{ text: promptText }],
@@ -229,6 +235,19 @@ app.post('/api/generate-avatar', requireAdmin, async (req: Request, res: Respons
 // 自動返信: Webhook / LP・HP用API / 管理API
 registerRoutes(app);
 
+// 存在しないAPI/Webhookは（画面のHTMLではなく）JSONの404を返す
+app.use(['/api', '/webhooks'], (_req: Request, res: Response) => {
+  res.status(404).json({ ok: false, error: 'not_found' });
+});
+
+// 壊れたJSONなどのリクエストエラーをJSONで返す（スタックトレースは出さない）
+app.use((err: any, _req: Request, res: Response, next: (e?: any) => void) => {
+  if (res.headersSent) return next(err);
+  const status = Number(err?.status || err?.statusCode) || 500;
+  if (status >= 500) console.error('[server] error:', err?.message || err);
+  res.status(status).json({ ok: false, error: status === 413 ? 'payload_too_large' : status < 500 ? 'bad_request' : 'internal_error' });
+});
+
 // Setup Vite middleware or static serving
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
@@ -246,15 +265,22 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    // 設定の抜け・誤りを起動時に一覧表示する
+    for (const line of setupChecklist()) console.log(line);
     startYouTubePoller();
-    if (!process.env.ADMIN_TOKEN) {
-      console.warn(
-        '[security] ADMIN_TOKEN が未設定です。管理画面・生成API・管理APIは、開発モードのローカル接続からのみ利用できます。本番では必ず設定してください。'
-      );
-    }
   });
+
+  // Cloud Run の停止（SIGTERM）や Ctrl+C でも、保存待ちのデータを書き出してから終了する
+  const shutdown = (signal: string) => {
+    console.log(`[server] ${signal} を受信。データを保存して終了します`);
+    flush();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer();

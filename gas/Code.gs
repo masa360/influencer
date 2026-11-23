@@ -75,6 +75,12 @@ function doPost(e) {
 
     const rowIndex = findRowById_(sheet, d.id);
     if (rowIndex > 0) {
+      // 通信の順番が前後しても、古い状態で上書きしない（C列＝更新日時で比較）
+      const current = sheet.getRange(rowIndex, 3).getValue();
+      const incoming = row[2];
+      if (current instanceof Date && incoming instanceof Date && incoming.getTime() < current.getTime()) {
+        return json_({ ok: true, skipped: 'older_update' });
+      }
       sheet.getRange(rowIndex, 1, 1, row.length).setValues([row]); // 既存行を更新
     } else {
       sheet.appendRow(row); // 新しい行を追加

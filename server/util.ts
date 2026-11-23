@@ -60,6 +60,18 @@ export function clipBytes(s: string, maxBytes: number): string {
   return out + '…';
 }
 
+/**
+ * 環境変数が「実際に設定されているか」。空文字や .env.example の仮の値（MY_GEMINI_API_KEY など）は未設定扱い。
+ *
+ * @example
+ * envValue('GEMINI_API_KEY'); // 未設定なら ''
+ */
+export function envValue(name: string): string {
+  const v = (process.env[name] || '').trim();
+  if (!v || /^MY_[A-Z_]+$/.test(v) || /^ここに/.test(v)) return '';
+  return v;
+}
+
 export function cleanInput(s: unknown, max = 2000): string {
   if (typeof s !== 'string') return '';
   // 制御文字を除去（改行・タブは残す）
