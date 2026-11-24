@@ -34,12 +34,22 @@ export interface Config {
   channels: Record<ChannelId, ChannelConfig>;
   youtube: { channelId: string; pollMinutes: number };
   web: { allowedOrigins: string[]; siteKey: string; holdingMessage: string };
-  limits: { perSenderPerHour: number; globalPerHour: number };
+  limits: {
+    perSenderPerHour: number;
+    globalPerHour: number;
+    /** AIが返信する回数の1日の上限（日本時間の0時にリセット）。0 は無制限。超えたらAIは返信せず「要人間対応」にする */
+    aiPerDay: number;
+  };
   disclosure: { enabled: boolean; text: string };
   handoffKeywords: string[];
   notifyWebhookUrl: string;
   /** 見込み客・要人間対応を、運営者自身のLINEにプッシュ通知する */
-  lineNotify: { enabled: boolean; userIds: string[] };
+  lineNotify: {
+    enabled: boolean;
+    userIds: string[];
+    /** 運営者へのLINE通知の月間上限（通数。日本時間の月初にリセット）。0 は無制限。無料プランの月200通を守るための歯止め */
+    monthlyCap: number;
+  };
   /** 全受信をGoogleスプレッドシート等に記録するWebhook（Google Apps Script のウェブアプリURLを想定） */
   sheetWebhookUrl: string;
   leadScoreThreshold: number;
@@ -66,6 +76,8 @@ export interface Entry {
   leadScore?: number;
   status: Status;
   note?: string;
+  /** 1日のAI返信の上限に達したため、AIが返信しなかった受信（通知を1日1回に絞るための印） */
+  capped?: boolean;
   /** 返信先の特定に使うプラットフォーム固有ID（commentId, replyToken など） */
   ref: Record<string, string>;
   source?: Source;
@@ -118,12 +130,12 @@ export function defaultConfig(): Config {
       siteKey: 'pk_' + rand(12),
       holdingMessage: 'メッセージありがとうございます！内容を確認のうえ、担当よりあらためてご返信します。',
     },
-    limits: { perSenderPerHour: 6, globalPerHour: 60 },
+    limits: { perSenderPerHour: 6, globalPerHour: 60, aiPerDay: 30 },
     // ステマ規制対策: 「運営者の公式AI」であることが伝わる文言を既定にする
     disclosure: { enabled: true, text: '（運営者公式のAIアシスタントによる自動返信です）' },
     handoffKeywords: ['返金', '解約', 'クレーム', '訴訟', '弁護士', '警察', '詐欺', '訴える', '被害'],
     notifyWebhookUrl: '',
-    lineNotify: { enabled: false, userIds: [] },
+    lineNotify: { enabled: false, userIds: [], monthlyCap: 100 },
     sheetWebhookUrl: '',
     leadScoreThreshold: 70,
     updatedAt: '',
@@ -350,8 +362,10 @@ export function updateConfig(patch: any): Config {
   if (patch.limits) {
     const a = num(patch.limits.perSenderPerHour, 1, 100);
     const b = num(patch.limits.globalPerHour, 1, 2000);
+    const d = num(patch.limits.aiPerDay, 0, 100000);
     if (a !== undefined) c.limits.perSenderPerHour = a;
     if (b !== undefined) c.limits.globalPerHour = b;
+    if (d !== undefined) c.limits.aiPerDay = d;
   }
 
   if (patch.disclosure) {
@@ -374,6 +388,8 @@ export function updateConfig(patch: any): Config {
   }
   if (patch.lineNotify && typeof patch.lineNotify === 'object') {
     if (typeof patch.lineNotify.enabled === 'boolean') c.lineNotify.enabled = patch.lineNotify.enabled;
+    const cap = num(patch.lineNotify.monthlyCap, 0, 1000000);
+    if (cap !== undefined) c.lineNotify.monthlyCap = cap;
     if (Array.isArray(patch.lineNotify.userIds)) {
       c.lineNotify.userIds = [
         ...new Set<string>(
@@ -537,6 +553,110 @@ export const getToken = (name: string): TokenRec | undefined => load().tokens[na
 export function setToken(name: string, t: TokenRec) {
   load().tokens[name] = t;
   scheduleSave();
+}
+
+// ---------- 使用回数（上限ガード用） ----------
+//
+// 1日・1か月の回数は、Cloud Run の再起動（使われていないと止まる）で消えないように、
+// 設定と同じデータファイル（kv）に保存する。日付は日本時間で切り替える。
+
+/**
+ * 日本時間の日付（YYYY-MM-DD）。
+ * @example jstDay(Date.UTC(2026, 10, 23, 15, 0, 0)); // '2026-11-24'（UTC 15:00 = 日本時間 0:00）
+ */
+export function jstDay(now = Date.now()): string {
+  return new Date(now + 9 * 3600_000).toISOString().slice(0, 10);
+}
+
+/** 日本時間の月（YYYY-MM） */
+export const jstMonth = (now = Date.now()): string => jstDay(now).slice(0, 7);
+
+const USAGE_PREFIXES = ['usage:ai:', 'usage:line:', 'flag:cap-notified:', 'flag:line-cap:'] as const;
+
+/** 62日より古い使用回数・フラグを消す（データが増え続けないように） */
+function pruneUsage(now: number) {
+  const kv = load().kv;
+  const cutoff = jstDay(now - 62 * 86400_000);
+  for (const k of Object.keys(kv)) {
+    const prefix = USAGE_PREFIXES.find((p) => k.startsWith(p));
+    if (!prefix) continue;
+    const when = k.slice(prefix.length); // YYYY-MM-DD または YYYY-MM
+    if (when < cutoff.slice(0, when.length)) delete kv[k];
+  }
+}
+
+/** 今日のAI返信の回数 */
+export function getAiCountToday(now = Date.now()): number {
+  return Number(getKv('usage:ai:' + jstDay(now))) || 0;
+}
+
+/**
+ * AI返信を1回使う。上限に達していれば使わずに false を返す。
+ *
+ * @param cap 1日の上限（0 は無制限）
+ * @returns true: 使えた（回数を1つ増やした） / false: 上限に達している
+ * @example
+ * if (!spendAiCall(cfg.limits.aiPerDay)) return '上限';
+ */
+export function spendAiCall(cap: number, now = Date.now()): boolean {
+  const key = 'usage:ai:' + jstDay(now);
+  const used = Number(getKv(key)) || 0;
+  if (cap > 0 && used >= cap) return false;
+  setKv(key, String(used + 1));
+  pruneUsage(now);
+  return true;
+}
+
+/** 今月のLINE通知の通数 */
+export function getLineNotifyCountMonth(now = Date.now()): number {
+  return Number(getKv('usage:line:' + jstMonth(now))) || 0;
+}
+
+/**
+ * 運営者へのLINE通知の通数を足す（LINEは届いた人数ぶんを数えるため、宛先の人数を渡す）。
+ * 送信に失敗したときに戻せるよう、マイナスの値も受け付ける（0未満にはならない）。
+ */
+export function addLineNotifyCount(recipients: number, now = Date.now()) {
+  const key = 'usage:line:' + jstMonth(now);
+  setKv(key, String(Math.max(0, (Number(getKv(key)) || 0) + recipients)));
+}
+
+/**
+ * 今月の上限に収まるか（0 は無制限）。
+ * @param recipients 今回送る宛先の人数
+ */
+export function canSpendLineNotify(cap: number, recipients: number, now = Date.now()): boolean {
+  return cap <= 0 || getLineNotifyCountMonth(now) + recipients <= cap;
+}
+
+/**
+ * 上限に収まるなら、通数を**先に確保**して true を返す（収まらなければ何もせず false）。
+ * 確認と確保を同時に行うので、通知が同時にいくつ来ても、上限を超えて送ってしまうことがない。
+ * 送信に失敗したら、呼び出し側で addLineNotifyCount(-人数) で戻す。
+ *
+ * @example
+ * if (reserveLineNotify(cap, ids.length)) { try { await push(); } catch { addLineNotifyCount(-ids.length); } }
+ */
+export function reserveLineNotify(cap: number, recipients: number, now = Date.now()): boolean {
+  if (!canSpendLineNotify(cap, recipients, now)) return false;
+  addLineNotifyCount(recipients, now);
+  return true;
+}
+
+/** 「上限に達した」通知を、その日に1回だけ出すための印。最初の1回だけ true */
+export function claimCapNotice(now = Date.now()): boolean {
+  const key = 'flag:cap-notified:' + jstDay(now);
+  if (getKv(key)) return false;
+  setKv(key, '1');
+  return true;
+}
+
+/** 「LINE通知の月間上限に達した」お知らせを、その月に1回だけ出すための印。最初の1回だけ true */
+export function claimLineCapNotice(now = Date.now()): boolean {
+  const key = 'flag:line-cap:' + jstMonth(now);
+  if (getKv(key)) return false;
+  setKv(key, '1');
+  return true;
 }
 
 export const getKv = (k: string): string | undefined => load().kv[k];

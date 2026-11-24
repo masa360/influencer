@@ -36,6 +36,12 @@
 - 提供する側向け：[docs/VENDOR_GUIDE.md](docs/VENDOR_GUIDE.md)／質問票：[docs/ONBOARDING_SHEET.md](docs/ONBOARDING_SHEET.md)／お客様向けの手引：[docs/CUSTOMER_GUIDE.md](docs/CUSTOMER_GUIDE.md)／利用条件のひな形：[docs/TERMS_TEMPLATE.md](docs/TERMS_TEMPLATE.md)
 - 1つのサーバーを複数のお客様で共有する方式（マルチテナント）は未対応です。需要が確認できてから作る想定です。
 
+## 上限ガード（費用の暴走防止）
+- **1日のAI返信の上限**（`limits.aiPerDay`、初期値30件、0＝無制限）：超えたらAIは呼ばず、受信は「要人間対応」になり、その日1回だけ通知。日本時間の0時にリセット。
+- **自分へのLINE通知の月間上限**（`lineNotify.monthlyCap`、初期値100通、0＝無制限）：LINE無料プラン（月200通）を守るため。上限に達したときに、止めるお知らせを1回だけ送る。
+- 使用状況は、再起動（Cloud Run は使われていないと止まる）しても消えないように、データファイルに保存する。画面上部に「今日のAI返信 ○ / ○件」などと表示。
+- 費用の目安は [docs/VENDOR_GUIDE.md](docs/VENDOR_GUIDE.md) の「4. 費用の目安」。
+
 ## 自動化している作業
 
 | 以前は手作業だったこと | いまは |

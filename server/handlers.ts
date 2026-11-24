@@ -1,5 +1,8 @@
 import {
+  addLineNotifyCount,
   CHANNEL_IDS,
+  getAiCountToday,
+  getLineNotifyCountMonth,
   isSafeWebhookUrl,
   newId,
   getApiKey,
@@ -292,6 +295,13 @@ function state(req: Req) {
     },
     apiKey: getApiKey(),
     stats: stats(),
+    // 上限ガードの使用状況（画面に表示）。cap が 0 のときは無制限
+    usage: {
+      aiToday: getAiCountToday(),
+      aiCap: cfg.limits.aiPerDay,
+      lineNotifyMonth: getLineNotifyCountMonth(),
+      lineNotifyCap: cfg.lineNotify.monthlyCap,
+    },
     adminProtected: !!envValue('ADMIN_TOKEN'),
   };
 }
@@ -389,6 +399,7 @@ export const adminTestNotify: Handler = guarded(async () => {
   } else {
     try {
       await pushLineToOwners(cfg.lineNotify.userIds, '【テスト通知】\n' + buildNotifyText(sample));
+      addLineNotifyCount(cfg.lineNotify.userIds.length); // テスト送信もLINEの通数に入る
       result.line = { ok: true, message: `${cfg.lineNotify.userIds.length}件のLINEに送信しました` };
     } catch (e) {
       result.line = { ok: false, message: (e as Error).message };

@@ -3,6 +3,9 @@ import { pushLineToOwners, sendReply } from './channels.ts';
 import { generateReply, type Intent } from './agent.ts';
 import {
   addHistory,
+  addLineNotifyCount,
+  claimCapNotice,
+  claimLineCapNotice,
   getConfig,
   getEntry,
   getHistory,
@@ -10,7 +13,9 @@ import {
   isSafeWebhookUrl,
   markSeen,
   newId,
+  reserveLineNotify,
   saveEntry,
+  spendAiCall,
   type ChannelId,
   type Config,
   type Entry,
@@ -131,6 +136,15 @@ export async function processInbound(inb: Inbound): Promise<Entry> {
   );
   if (!ok) return finish({ status: 'skipped', note: 'rate_limited' });
 
+  // 1日のAI返信の上限（費用の暴走防止）。超えたらAIは呼ばず、あなたが対応する「要人間対応」にする
+  if (!spendAiCall(cfg.limits.aiPerDay)) {
+    return finish({
+      status: 'needs_human',
+      capped: true,
+      note: `1日のAI返信の上限（${cfg.limits.aiPerDay}件）に達したため、AIは返信していません。あなたが対応してください`,
+    });
+  }
+
   const history = getHistory(entry.conversationKey);
   const isFirstReply = !history.some((m) => m.sender === 'influencer');
   addHistory(entry.conversationKey, { sender: 'prospect', text });
@@ -230,6 +244,8 @@ const ERROR_NOTIFY_WINDOW_MS = 30 * 60_000;
  */
 function shouldNotify(e: Entry): boolean {
   const cfg = getConfig();
+  // 1日の上限に達したときは、毎回ではなく、その日の最初の1回だけ通知する
+  if (e.capped) return claimCapNotice();
   if (e.status === 'needs_human') return true;
   if (e.status === 'error') return tryConsume([{ key: 'notify-error', max: 1 }], ERROR_NOTIFY_WINDOW_MS);
   return (e.leadScore ?? 0) >= cfg.leadScoreThreshold && e.status !== 'skipped';
@@ -237,8 +253,9 @@ function shouldNotify(e: Entry): boolean {
 
 /** 通知本文（LINE・Slack・Discord 共通） */
 export function buildNotifyText(e: Entry): string {
-  const label =
-    e.status === 'error'
+  const label = e.capped
+    ? `⏸ 今日のAI返信の上限に達しました\n${(e.note || '').slice(0, 150)}\n※ 以降のメッセージはAIが返信せず、受信ログに「要人間対応」として残ります（通知は今日はこの1回だけ）`
+    : e.status === 'error'
       ? `⚠️ 返信エラー（見込み客に返信できていません）\n理由：${(e.note || '不明').slice(0, 150)}\n※ 同様のエラーは30分間通知しません`
       : e.status === 'needs_human'
         ? '🙋 要人間対応'
@@ -256,6 +273,42 @@ export function buildNotifyText(e: Entry): string {
 }
 
 /**
+ * 運営者のLINEに通知する。月間の通数の上限（無料プランの月200通を守るため）を超えるときは送らない。
+ * 上限に達した最初の1回だけ、「以降の通知を止める」お知らせを送る（その1通は上限の余裕分で送る）。
+ *
+ * @example
+ * await notifyOwnersByLine(getConfig().lineNotify, '🔥 見込み客が来ました');
+ */
+export async function notifyOwnersByLine(ln: { userIds: string[]; monthlyCap: number }, text: string): Promise<boolean> {
+  const need = ln.userIds.length;
+  // 通数は送る前に確保する（同時に複数の通知が来ても、上限を超えないように）。失敗したら戻す
+  if (!reserveLineNotify(ln.monthlyCap, need)) {
+    console.warn(`[notify:line] 今月の通知の上限（${ln.monthlyCap}通）に達したため、LINE通知を送りません`);
+    if (claimLineCapNotice()) {
+      addLineNotifyCount(need); // お知らせの1通は、上限の余裕分で送る
+      try {
+        await pushLineToOwners(
+          ln.userIds,
+          `⏸ 今月のLINE通知の上限（${ln.monthlyCap}通）に達しました。\n以降の通知は来月まで止まります。見込み客や要人間対応は、受信ログ（アプリ・スプレッドシート）で確認してください。`
+        );
+      } catch (err) {
+        addLineNotifyCount(-need);
+        console.warn('[notify:line] cap notice failed:', (err as Error).message);
+      }
+    }
+    return false;
+  }
+  try {
+    await pushLineToOwners(ln.userIds, text);
+    return true;
+  } catch (err) {
+    addLineNotifyCount(-need);
+    console.warn('[notify:line] failed:', (err as Error).message);
+    return false;
+  }
+}
+
+/**
  * 高スコアのリード/要人間対応を通知する（任意）。
  * - 運営者のLINE（設定「LINE通知」）
  * - 通知先Webhook（Slack / Discord など）
@@ -266,11 +319,7 @@ async function notifyIfNeeded(e: Entry) {
   const text = buildNotifyText(e);
 
   if (cfg.lineNotify.enabled && cfg.lineNotify.userIds.length) {
-    try {
-      await pushLineToOwners(cfg.lineNotify.userIds, text);
-    } catch (err) {
-      console.warn('[notify:line] failed:', (err as Error).message);
-    }
+    await notifyOwnersByLine(cfg.lineNotify, text);
   }
 
   const url = cfg.notifyWebhookUrl;

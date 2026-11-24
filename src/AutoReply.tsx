@@ -248,6 +248,7 @@ export default function AutoReply({ persona, bossProfile, onLoadFromServer }: Pr
         lineNotify: {
           enabled: !!draft.lineNotify?.enabled,
           userIds: lineIdsText.split(/[\s,、]+/).map((s) => s.trim()).filter(Boolean),
+          monthlyCap: draft.lineNotify?.monthlyCap,
         },
         sheetWebhookUrl: draft.sheetWebhookUrl,
         leadScoreThreshold: draft.leadScoreThreshold,
@@ -539,6 +540,32 @@ export default function AutoReply({ persona, bossProfile, onLoadFromServer }: Pr
         </button>
       </div>
 
+      {server.usage && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          {([
+            ['今日のAI返信', server.usage.aiToday, server.usage.aiCap, '件'],
+            ['今月の自分へのLINE通知', server.usage.lineNotifyMonth, server.usage.lineNotifyCap, '通'],
+          ] as [string, number, number, string][]).map(([label, used, cap, unit]) => {
+            const full = cap > 0 && used >= cap;
+            const near = cap > 0 && !full && used >= cap * 0.8;
+            return (
+              <div
+                key={label}
+                className={`rounded-xl border px-4 py-2 text-xs flex items-center justify-between ${
+                  full ? 'bg-rose-500/10 border-rose-500/30 text-rose-200' : near ? 'bg-amber-500/10 border-amber-500/30 text-amber-200' : 'bg-slate-900 border-slate-800 text-slate-300'
+                }`}
+              >
+                <span>{label}</span>
+                <span className="font-semibold">
+                  {used} / {cap > 0 ? `${cap}${unit}` : '無制限'}
+                  {full ? '（上限に達しています）' : near ? '（まもなく上限）' : ''}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {(error || flash) && (
         <div className={`rounded-xl border px-4 py-2 text-xs flex items-center gap-2 ${error ? 'bg-rose-500/10 border-rose-500/30 text-rose-200' : 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'}`}>
           {error ? <AlertCircle className="w-4 h-4" /> : <CheckCircle2 className="w-4 h-4" />}
@@ -744,6 +771,16 @@ export default function AutoReply({ persona, bossProfile, onLoadFromServer }: Pr
           <div>
             <label className="text-[11px] font-semibold text-slate-400">全体の返信上限（回/時間）</label>
             <input type="number" min={1} max={2000} className={inputCls + ' mt-1'} value={draft.limits.globalPerHour} onChange={(e) => setField(['limits', 'globalPerHour'], Number(e.target.value))} />
+          </div>
+          <div>
+            <label className="text-[11px] font-semibold text-slate-400">1日のAI返信の上限（件。0＝無制限）</label>
+            <input type="number" min={0} max={100000} className={inputCls + ' mt-1'} value={draft.limits.aiPerDay ?? 30} onChange={(e) => setField(['limits', 'aiPerDay'], Number(e.target.value))} />
+            <p className="text-[11px] text-slate-500 mt-1">超えたらAIは返信せず「要人間対応」になり、その日1回だけLINEで通知します（日本時間0時にリセット）。Geminiの利用料の暴走を防ぎます。</p>
+          </div>
+          <div>
+            <label className="text-[11px] font-semibold text-slate-400">自分へのLINE通知の月間上限（通。0＝無制限）</label>
+            <input type="number" min={0} max={1000000} className={inputCls + ' mt-1'} value={draft.lineNotify?.monthlyCap ?? 100} onChange={(e) => setField(['lineNotify', 'monthlyCap'], Number(e.target.value))} />
+            <p className="text-[11px] text-slate-500 mt-1">LINE公式アカウントの無料プランは月200通までです（通知・下書き承認後の送信が数えられます）。上限に達すると、その月の通知は止まります。</p>
           </div>
         </div>
         <div>

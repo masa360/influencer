@@ -815,3 +815,122 @@ test('GASコード: 合言葉入りで配布され、記録時はURLに合言葉
   assert.equal(pipeline.sheetUrlWithKey(url + '?key=mine'), url + '?key=mine');
   assert.equal(pipeline.sheetUrlWithKey('http://insecure.example.com'), '');
 });
+
+// ============================================================ 上限ガード（費用の暴走防止）
+
+test('日本時間の日付の切り替え（UTC 15:00 = 日本時間 0:00）', () => {
+  assert.equal(store.jstDay(Date.UTC(2026, 10, 23, 14, 59, 59)), '2026-11-23');
+  assert.equal(store.jstDay(Date.UTC(2026, 10, 23, 15, 0, 0)), '2026-11-24');
+  assert.equal(store.jstMonth(Date.UTC(2026, 11, 31, 15, 0, 0)), '2027-01');
+});
+
+test('AI返信の1日上限: 超えたらGeminiを呼ばず要人間対応になる', async () => {
+  setup({ line: 'auto' });
+  store.updateConfig({ limits: { aiPerDay: 2 } });
+  const out = [];
+  for (let i = 0; i < 4; i++) {
+    out.push(await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'cap' + i, senderId: 'U' + i, text: '相談したい' + i, ref: { replyToken: 'rt', receivedAt: String(Date.now()) } }));
+  }
+  assert.deepEqual(out.map((e) => e.status), ['sent', 'sent', 'needs_human', 'needs_human']);
+  assert.equal(genCalls, 2, '上限を超えたらAIは呼ばない');
+  assert.equal(out[2].capped, true);
+  assert.match(out[2].note!, /1日のAI返信の上限（2件）/);
+  assert.equal(calls.filter((c) => c.url.endsWith('/v2/bot/message/reply')).length, 2, '上限後は見込み客に自動返信しない');
+  assert.equal(store.getAiCountToday(), 2);
+});
+
+test('AI返信の1日上限: 0は無制限', async () => {
+  setup({ line: 'auto' });
+  store.updateConfig({ limits: { aiPerDay: 0 } });
+  for (let i = 0; i < 5; i++) await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'un' + i, senderId: 'U' + i, text: 'hi' + i, ref: {} });
+  assert.equal(genCalls, 5);
+});
+
+test('AI返信の1日上限: 失敗した呼び出しも数える／日が変わると戻る／再起動しても残る', async () => {
+  setup({ line: 'auto' });
+  genImpl = () => {
+    throw new Error('boom');
+  };
+  store.updateConfig({ limits: { aiPerDay: 3 } });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'f1', senderId: 'U1', text: 'a', ref: {} });
+  assert.equal(store.getAiCountToday(), 1, '失敗も料金がかかりうるので数える');
+
+  // 実際の「今日」の回数と混ざらないように、昔の日付で確認する
+  const day1 = Date.UTC(2020, 5, 1, 14, 0, 0); // 日本時間 2020-06-01 23:00
+  const day2 = Date.UTC(2020, 5, 1, 16, 0, 0); // 日本時間 2020-06-02 01:00
+  assert.equal(store.spendAiCall(1, day1), true);
+  assert.equal(store.spendAiCall(1, day1), false);
+  assert.equal(store.spendAiCall(1, day2), true, '日本時間で日付が変わったら使える');
+
+  store.flush();
+  store.resetForTests();
+  assert.equal(store.getAiCountToday(day1), 1, '再起動（ファイルから読み直し）しても残る');
+});
+
+test('上限に達した通知は、その日1回だけ送る', async () => {
+  setup({ line: 'auto' });
+  store.updateConfig({ limits: { aiPerDay: 1 }, lineNotify: { enabled: true, userIds: [OWNER] }, leadScoreThreshold: 100 });
+  for (let i = 0; i < 4; i++) await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'cn' + i, senderId: 'U' + i, text: '相談' + i, ref: {} });
+  await sleep(30);
+  const m = calls.filter((c) => c.url.endsWith('/multicast'));
+  assert.equal(m.length, 1, '3件が上限超えでも通知は1回');
+  assert.match(m[0].body.messages[0].text, /今日のAI返信の上限に達しました/);
+});
+
+test('LINE通知の月間上限: 超える通知は送らず、止めるお知らせを1回だけ送る', async () => {
+  setup({ line: 'draft' });
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER], monthlyCap: 3 }, leadScoreThreshold: 0, limits: { aiPerDay: 0 } });
+  for (let i = 0; i < 6; i++) await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'mc' + i, senderId: 'U' + i, text: '相談' + i, ref: {} });
+  await sleep(40);
+  const sent = calls.filter((c) => c.url.endsWith('/multicast')).map((c) => c.body.messages[0].text);
+  assert.equal(sent.filter((t) => t.startsWith('🔥')).length, 3, '上限の3通まで');
+  assert.equal(sent.filter((t) => /通知の上限（3通）に達しました/.test(t)).length, 1, 'お知らせは1回だけ');
+  assert.equal(store.getLineNotifyCountMonth(), 4, 'お知らせの1通も数える');
+});
+
+test('LINE通知の月間上限: 宛先が複数なら人数ぶん数える／0は無制限', async () => {
+  const U2 = 'U' + 'f'.repeat(32);
+  setup({ line: 'draft' });
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER, U2], monthlyCap: 3 }, leadScoreThreshold: 0, limits: { aiPerDay: 0 } });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'm1', senderId: 'A', text: 'x', ref: {} });
+  await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'm2', senderId: 'B', text: 'y', ref: {} });
+  await sleep(30);
+  assert.equal(store.getLineNotifyCountMonth() >= 2, true);
+  const normal = calls.filter((c) => c.url.endsWith('/multicast') && c.body.messages[0].text.startsWith('🔥'));
+  assert.equal(normal.length, 1, '2人×2回=4通は上限3を超えるので、2回目は送らない');
+
+  calls = [];
+  store.updateConfig({ lineNotify: { monthlyCap: 0 } });
+  for (let i = 0; i < 3; i++) await pipeline.processInbound({ channel: 'line', kind: 'dm', eventId: 'u' + i, senderId: 'C' + i, text: 'z', ref: {} });
+  await sleep(30);
+  assert.equal(calls.filter((c) => c.url.endsWith('/multicast')).length, 3, '無制限');
+});
+
+test('上限の設定値の検証と、管理画面に使用状況が返る', async () => {
+  store.updateConfig({ limits: { aiPerDay: -5 }, lineNotify: { monthlyCap: 'abc' as any } });
+  assert.equal(store.getConfig().limits.aiPerDay, 0, 'マイナスは0（無制限）に丸められる');
+  assert.equal(store.getConfig().lineNotify.monthlyCap, 100, '数値でなければ変更しない');
+  store.updateConfig({ limits: { aiPerDay: 999999999 } });
+  assert.equal(store.getConfig().limits.aiPerDay, 100000);
+
+  store.updateConfig({ limits: { aiPerDay: 30 }, lineNotify: { monthlyCap: 100 } });
+  store.spendAiCall(30);
+  const s = (await h.adminGetState(req({ method: 'GET', headers: { authorization: 'Bearer admin-secret' } }))) as any;
+  assert.deepEqual(s.body.usage, { aiToday: 1, aiCap: 30, lineNotifyMonth: 0, lineNotifyCap: 100 });
+});
+
+test('テスト送信もLINE通知の通数に数える', async () => {
+  store.updateConfig({ lineNotify: { enabled: true, userIds: [OWNER] } });
+  await h.adminTestNotify(req({ headers: { authorization: 'Bearer admin-secret' } }));
+  assert.equal(store.getLineNotifyCountMonth(), 1);
+});
+
+test('古い使用回数は消える（データが増え続けない）', () => {
+  const old = Date.UTC(2026, 0, 10, 0, 0, 0);
+  store.spendAiCall(0, old);
+  store.addLineNotifyCount(1, old);
+  assert.equal(store.getAiCountToday(old), 1);
+  store.spendAiCall(0, Date.UTC(2026, 10, 23)); // 約10か月後
+  assert.equal(store.getAiCountToday(old), 0, '62日より古い回数は削除');
+  assert.equal(store.getLineNotifyCountMonth(old), 0);
+});
